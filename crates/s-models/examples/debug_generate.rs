@@ -12,7 +12,7 @@ fn main() {
     eprintln!("IDS={:?}", ids);
     println!("prompt: {prompt:?} -> {:?} ids", ids.len());
 
-    for _ in 0..12 {
+    for _ in 0..(std::env::args().nth(3).and_then(|s| s.parse::<usize>().ok()).unwrap_or(12)) {
         let logits = model.forward(&ids);
         let argmax = logits
             .iter()
