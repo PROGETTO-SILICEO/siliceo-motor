@@ -116,6 +116,11 @@ dependencies = [
 [[package]]
 name = "s-server"
 version = "0.1.0"
+dependencies = [
+ "s-gguf",
+ "s-models",
+ "s-tokenizer",
+]
 
 [[package]]
 name = "s-speculative"

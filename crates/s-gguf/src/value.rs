@@ -25,8 +25,8 @@ pub enum GgufValue {
 }
 
 impl GgufValue {
-    /// Legge un valore del tipo `vt` dal cursore.
-    pub fn read(c: &mut Cursor, vt: u32) -> Result<Self> {
+    /// Legge un valore del tipo `vt` dal cursore. (Interno: `Cursor` è pub(crate).)
+    pub(crate) fn read(c: &mut Cursor, vt: u32) -> Result<Self> {
         Ok(match vt {
             0 => Self::U8(c.read_u8()?),
             1 => Self::I8(c.read_u8()? as i8),

@@ -226,6 +226,10 @@ impl Tokenizer {
     pub fn eos_id(&self) -> Option<u32> {
         self.eos_id
     }
+    /// Lookup diretto id di un token esatto (es. token speciali "<|im_end|>").
+    pub fn token_to_id(&self, tok: &str) -> Option<u32> {
+        self.token_to_id.get(tok).copied()
+    }
 }
 
 fn gguf_array_str(gguf: &s_gguf::GgufFile, key: &str) -> Result<Vec<String>> {

@@ -5,4 +5,11 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[[bin]]
+name = "s-server"
+path = "src/main.rs"
+
 [dependencies]
+s-models = { path = "../s-models" }
+s-tokenizer = { path = "../s-tokenizer" }
+s-gguf = { path = "../s-gguf" }

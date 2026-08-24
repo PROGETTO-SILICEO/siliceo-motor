@@ -3,11 +3,11 @@
 //! Design F1: semplicità e correttezza prima della velocità.
 //! - Pesi dequantizzati in f32 al load (0.5B → ~2GB RAM, accettabile).
 //! - Attenzione causale full-recompute (niente KV cache: la porta s-kv in F2).
-//! - RoPE stile NORM (coppie interleaved (2i, 2i+1)) — quello di llama/qwen2.
+//! - RoPE stile NEOX (half-split, coppie (i, i+hd/2)) — verificato empiricamente.
 //!
-//! Verifica F1: top-logprobs del prossimo token == llama.cpp (nodo2070).
+//! Verifica F1: generazione greedy token-identica a llama.cpp (nodo2070).
 
-use s_gguf::{GgufFile, GgmlType};
+use s_gguf::GgufFile;
 
 #[derive(Debug, Clone)]
 pub struct Config {
@@ -89,10 +89,6 @@ struct LayerWeights {
 
 fn dequant_tensor(gguf: &mut GgufFile, name: &str) -> Result<Vec<f32>, String> {
     gguf.tensor_data_f32(name).map_err(|e| format!("{name}: {e}"))
-}
-
-fn mut_ok(gguf: &mut GgufFile, name: &str) -> Result<Vec<f32>, String> {
-    dequant_tensor(gguf, name)
 }
 
 impl Model {
