@@ -1,19 +1,18 @@
-//! Parity tokenizer: i nostri IDs contro llama-tokenize (beellama, nodo2070).
+//! Parity tokenizer: i nostri IDs contro llama-tokenize (llama.cpp).
 //!
-//! Riferimento (qwen2.5-0.5b-instruct-q4_k_m.gguf):
-//!   prompt: "Ciao dal motore sovrano! Test 123. Test 123."
-//!   output: [34, 22516, 1674, 21470, 704, 11, 3815, 3852, 460, 773, 18920,
-//!            5652, 342, 8832, 264, 220, 22, 20, 9628, 2687, 0, 3393, 220, 16, 17, 18, 13]
+//! Riferimento (qwen2.5-0.5b-instruct-q4_k_m.gguf, llama-tokenize):
+//!   prompt: "Il motore sovrano genera token identici! Test 123."
+//!   output: [12050, 3852, 460, 773, 18920, 5652, 83435, 3950,
+//!            3524, 3375, 0, 3393, 220, 16, 17, 18, 13]
 //!
 //! Attivazione: S_TOKENIZER_QWEN05B=<gguf> cargo test -p s-tokenizer --test parity
 
 use s_tokenizer::Tokenizer;
 
 const REF: &[u32] = &[
-    34, 22516, 1674, 21470, 704, 11, 3815, 3852, 460, 773, 18920, 5652, 342, 8832, 264, 220, 22,
-    20, 9628, 2687, 0, 3393, 220, 16, 17, 18, 13,
+    12050, 3852, 460, 773, 18920, 5652, 83435, 3950, 3524, 3375, 0, 3393, 220, 16, 17, 18, 13,
 ];
-const PROMPT: &str = "Ciao dal motore sovrano! Test 123. Test 123.";
+const PROMPT: &str = "Il motore sovrano genera token identici! Test 123.";
 
 #[test]
 fn parity_with_llama_tokenize() {

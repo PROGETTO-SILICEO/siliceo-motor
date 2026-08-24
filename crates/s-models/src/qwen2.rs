@@ -5,7 +5,7 @@
 //! - Attenzione causale full-recompute (niente KV cache: la porta s-kv in F2).
 //! - RoPE stile NEOX (half-split, coppie (i, i+hd/2)) — verificato empiricamente.
 //!
-//! Verifica F1: generazione greedy token-identica a llama.cpp (nodo2070).
+//! Verifica F1: generazione greedy token-identica a llama.cpp.
 
 use s_gguf::GgufFile;
 

@@ -1,6 +1,6 @@
-//! Parity test F0: il nostro parser contro llama-gguf (beellama) su file reale.
+//! Parity test F0: il nostro parser contro llama.cpp `llama-gguf` su file reale.
 //!
-//! Riferimento misurato con `llama-gguf file r n` su nodo2070 (beellama build):
+//! Riferimento misurato con `llama-gguf file r n`:
 //!   version 3, alignment 32, data offset 5947744, n_kv 26, n_tensors 291
 //!   tensor[0] = output.weight  size=144643072 offset=0
 //!   tensor[1] = token_embd.weight size=93592576 offset=144643072
@@ -12,7 +12,7 @@
 fn parity_with_llama_gguf() {
     let Ok(path) = std::env::var("S_GGUF_QWEN05B") else { return; };
 
-    // --- riferimento (misurato con llama-gguf su beellama, nodo2070) ---
+    // --- riferimento (misurato con llama-gguf di llama.cpp) ---
     const REF_N_TENSORS: u64 = 291;
     const REF_N_KV: u64 = 26;
     const REF_ALIGNMENT: u64 = 32;
