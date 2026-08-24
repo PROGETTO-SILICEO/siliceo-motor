@@ -6,3 +6,5 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+s-gguf = { path = "../s-gguf" }
+s-tokenizer = { path = "../s-tokenizer" }

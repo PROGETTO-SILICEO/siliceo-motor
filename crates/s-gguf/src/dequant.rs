@@ -56,6 +56,22 @@ pub fn dequant_q8_0(block: &[u8], out: &mut [f32]) {
     }
 }
 
+/// Dequantizza un blocco Q5_0 (22 byte → 32 f32).
+/// Layout: [d:fp16][qh:4 byte][qs:16 byte nibbles].
+/// Bit alti da ggml-quants.c: per il valore l, byte qh[l/4], bit l%4
+/// (xh_0) e bit l%4+4 (xh_1). Valore = (nibble - bit_alto*16) * d.
+pub fn dequant_q5_0(block: &[u8], out: &mut [f32]) {
+    let d = fp16_to_f32(block[0] as u16 | ((block[1] as u16) << 8));
+    let qh = &block[2..6];
+    let qs = &block[6..22];
+    for l in 0..16 {
+        let xh_0 = (((qh[l >> 2] >> (l & 3)) & 1) << 4) as i32;
+        let xh_1 = (((qh[l >> 2] >> ((l & 3) | 4)) & 1) << 4) as i32;
+        out[l] = d * (((qs[l] & 0x0F) as i32 - xh_0) as f32);
+        out[l + 16] = d * (((qs[l] >> 4) as i32 - xh_1) as f32);
+    }
+}
+
 /// Dequantizza un blocco Q4_K (144 byte → 256 f32). Layout: [d:fp16][dmin:fp16]
 /// [scales:12][qs:128]. Formula dequantize_row_q4_K: x = d*ds*q - dmin*ms.
 pub fn dequant_q4_k(block: &[u8], out: &mut [f32]) {
@@ -148,6 +164,15 @@ pub fn dequantize(info: &TensorInfo, raw: &[u8]) -> Result<Vec<f32>> {
             }
             for (i, chunk) in raw.chunks_exact(2).take(n).enumerate() {
                 out[i] = bf16_to_f32(chunk[0] as u16 | ((chunk[1] as u16) << 8));
+            }
+        }
+        GgmlType::Q5_0 => {
+            let (bs, tb) = GgmlType::Q5_0.block_layout();
+            let mut off = 0usize;
+            for block in raw.chunks_exact(tb) {
+                if off + bs > n { break; }
+                dequant_q5_0(block, &mut out[off..off + bs]);
+                off += bs;
             }
         }
         GgmlType::Q8_0 => {
