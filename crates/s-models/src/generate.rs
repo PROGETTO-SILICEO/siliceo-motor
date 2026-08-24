@@ -68,8 +68,8 @@ impl Generated {
 
 /// Genera da un prompt già tokenizzato.
 ///
-/// Il forward è full-recompute: ad ogni passo ricalcola tutta la sequenza.
-/// Lento ma esatto — è la base su cui F3+ costruiranno la KV cache.
+/// Usa la KV cache incrementale: prefill una volta sola, poi un token per
+/// passo. L'output è identico al full-recompute (verificato dai test).
 pub fn generate(
     model: &Model,
     tok: &Tokenizer,
@@ -87,16 +87,26 @@ pub fn generate(
     let eos_all: Vec<u32> =
         tok.eos_id().into_iter().chain(params.extra_eos.iter().copied()).collect();
 
-    let mut ids = prompt_ids.to_vec();
-    let mut generated: Vec<u32> = Vec::with_capacity(params.max_tokens);
-    // Testo già ritagliato da una stop string (Some ⇒ finish_reason = "stop")
-    let mut stopped_text: Option<String> = None;
+    // cache dimensionata con margine per i token generati
+    let max_seq = prompt_ids.len() + params.max_tokens;
+    let mut cache = crate::kv::KvCache::new(&model.config, max_seq);
 
-    for _ in 0..params.max_tokens {
-        let logits = model.forward(&ids);
-        let next = sampler.sample(&logits, &mut rng) as u32;
-        ids.push(next);
+    let mut generated: Vec<u32> = Vec::with_capacity(params.max_tokens);
+    let mut stopped_text: Option<String> = None;
+    let mut next_logits;
+
+    // ── prefill: tutto il prompt in un colpo ──
+    next_logits = model.forward_cached(prompt_ids, &mut cache);
+    let mut last_token = *prompt_ids.last().unwrap_or(&0);
+
+    for step in 0..params.max_tokens {
+        // il token appena predetto diventa l'input del prossimo passo
+        if step > 0 {
+            next_logits = model.forward_cached(&[last_token], &mut cache);
+        }
+        let next = sampler.sample(&next_logits, &mut rng) as u32;
         generated.push(next);
+        last_token = next;
 
         if eos_all.contains(&next) {
             break;

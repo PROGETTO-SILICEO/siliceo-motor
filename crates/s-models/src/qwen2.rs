@@ -412,6 +412,127 @@ impl Model {
         }
         logits
     }
+    /// Forward con KV cache incrementale — F2.5.
+    ///
+    /// Processa `tokens` partendo dalla posizione assoluta `cache.len`
+    /// (prefill: tutto il prompt in un colpo; decode: un token per chiamata).
+    /// K/V vengono scritti nella cache e riusati: il decode è O(n), non O(n²).
+    ///
+    /// Invariante verificato dai test: stesso output esatto di `forward()`.
+    pub fn forward_cached(&self, tokens: &[u32], cache: &mut crate::kv::KvCache) -> Vec<f32> {
+        let c = &self.config;
+        let pos0 = cache.len;
+        let seq = tokens.len();
+        let (ne, hd) = (c.n_embd, c.head_dim);
+        let kv_dim = c.n_kv_heads * hd;
+
+        // embedding lookup (solo i nuovi token)
+        let mut x = vec![0.0f32; seq * ne];
+        for (s, &t) in tokens.iter().enumerate() {
+            let off = t as usize * ne;
+            x[s * ne..(s + 1) * ne].copy_from_slice(&self.tok_embd[off..off + ne]);
+        }
+
+        let mut normed = vec![0.0f32; seq * ne];
+        let mut q = vec![0.0f32; seq * ne];
+        let mut k_new = vec![0.0f32; seq * kv_dim];
+        let mut v_new = vec![0.0f32; seq * kv_dim];
+        let mut attn_scores = vec![0.0f32; pos0 + seq];
+        let mut attn_out = vec![0.0f32; seq * ne];
+        let mut tmp1 = vec![0.0f32; seq * c.n_ff.max(ne)];
+        let mut tmp2 = vec![0.0f32; seq * c.n_ff.max(ne)];
+
+        for (li, layer) in self.layers.iter().enumerate() {
+            rmsnorm_into(&x, &mut normed, seq, ne, &layer.attn_norm, c.rms_eps);
+
+            matmul_rows(&layer.wq, ne, ne, &normed, seq, &mut q);
+            matmul_rows(&layer.wk, kv_dim, ne, &normed, seq, &mut k_new);
+            matmul_rows(&layer.wv, kv_dim, ne, &normed, seq, &mut v_new);
+            add_bias_rows(&mut q, &layer.bq, seq, ne);
+            add_bias_rows(&mut k_new, &layer.bk, seq, kv_dim);
+            add_bias_rows(&mut v_new, &layer.bv, seq, kv_dim);
+
+            // RoPE con posizione ASSOLUTA (i token nuovi continuano la sequenza)
+            rope_norm_offset(&mut q, seq, c.n_heads, hd, c.rope_theta, pos0);
+            rope_norm_offset(&mut k_new, seq, c.n_kv_heads, hd, c.rope_theta, pos0);
+
+            // scrivi K/V nuovi nella cache
+            cache.layer_k_mut(li)[..seq * kv_dim].copy_from_slice(&k_new);
+            cache.layer_v_mut(li)[..seq * kv_dim].copy_from_slice(&v_new);
+
+            // attenzione: query s (pos assoluta pos0+s) guarda le chiavi 0..=pos0+s
+            let total = pos0 + seq;
+            let k_all = cache.layer_k_upto(li, total);
+            let v_all = cache.layer_v_upto(li, total);
+            let heads_per_kv = c.n_heads / c.n_kv_heads;
+            let scale = 1.0 / (hd as f32).sqrt();
+            for s in 0..seq {
+                for h in 0..c.n_heads {
+                    let kvh = h / heads_per_kv;
+                    let abs_s = pos0 + s;
+                    for t in 0..=abs_s {
+                        let q_off = (s * ne) + h * hd;
+                        let k_off = (t * kv_dim) + kvh * hd;
+                        let mut dot = 0.0f32;
+                        for d in 0..hd {
+                            dot += q[q_off + d] * k_all[k_off + d];
+                        }
+                        attn_scores[t] = dot * scale;
+                    }
+                    softmax_row(&mut attn_scores[..=abs_s]);
+                    let o_off = (s * ne) + h * hd;
+                    for d in 0..hd {
+                        attn_out[o_off + d] = 0.0;
+                    }
+                    for t in 0..=abs_s {
+                        let w = attn_scores[t];
+                        let v_off = (t * kv_dim) + kvh * hd;
+                        for d in 0..hd {
+                            attn_out[o_off + d] += w * v_all[v_off + d];
+                        }
+                    }
+                }
+            }
+
+            matmul_rows(&layer.wo, ne, ne, &attn_out, seq, &mut tmp1);
+            for i in 0..seq * ne {
+                x[i] += tmp1[i];
+            }
+
+            rmsnorm_into(&x, &mut normed, seq, ne, &layer.ffn_norm, c.rms_eps);
+            let gate = &mut tmp1[..seq * c.n_ff];
+            matmul_rows(&layer.w_gate, c.n_ff, ne, &normed, seq, gate);
+            let up = &mut tmp2[..seq * c.n_ff];
+            matmul_rows(&layer.w_up, c.n_ff, ne, &normed, seq, up);
+            for i in 0..seq * c.n_ff {
+                gate[i] = silu(gate[i]) * up[i];
+            }
+            let down = &mut tmp2[..seq * ne];
+            matmul_rows(&layer.w_down, ne, c.n_ff, gate, seq, down);
+            for i in 0..seq * ne {
+                x[i] += down[i];
+            }
+        }
+
+        cache.advance(seq);
+
+        // final norm + logits sull'ULTIMO token
+        let mut last = vec![0.0f32; ne];
+        last.copy_from_slice(&x[(seq - 1) * ne..seq * ne]);
+        let last = rmsnorm_row(&last, &self.output_norm, c.rms_eps);
+
+        let mut logits = vec![0.0f32; c.vocab_size];
+        for o in 0..c.vocab_size {
+            let w_off = o * ne;
+            let mut sum = 0.0f32;
+            for d in 0..ne {
+                sum += self.output[w_off + d] * last[d];
+            }
+            logits[o] = sum;
+        }
+        logits
+    }
+
 }
 
 // ── primitive ──
@@ -458,13 +579,19 @@ fn add_bias_rows(y: &mut [f32], b: &[f32], seq: usize, n: usize) {
 /// Verificato empiricamente su Qwen2.5: top-5 logits identico a llama.cpp
 /// (lo stile interleaved/NORM dà top-1 diverso già dal primo token generato).
 fn rope_norm(x: &mut [f32], seq: usize, n_heads: usize, hd: usize, theta: f32) {
+    rope_norm_offset(x, seq, n_heads, hd, theta, 0);
+}
+
+/// RoPE NEOX con posizione assoluta di partenza (per il forward con cache:
+/// i token nuovi continuano la sequenza, le loro posizioni non ripartono da 0).
+fn rope_norm_offset(x: &mut [f32], seq: usize, n_heads: usize, hd: usize, theta: f32, pos0: usize) {
     let half = hd / 2;
     for s in 0..seq {
         for h in 0..n_heads {
             let base = (s * n_heads + h) * hd;
             for i in 0..half {
                 let freq = (theta).powf(-(2.0 * i as f32) / hd as f32);
-                let angle = s as f32 * freq;
+                let angle = (s + pos0) as f32 * freq;
                 let (sin, cos) = angle.sin_cos();
                 let x0 = x[base + i];
                 let x1 = x[base + i + half];

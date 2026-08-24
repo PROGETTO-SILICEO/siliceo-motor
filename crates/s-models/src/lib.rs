@@ -4,6 +4,7 @@
 //! QKV). Obiettivo: PARITY dei logits con llama.cpp sullo stesso prompt.
 
 pub mod generate;
+pub mod kv;
 pub mod qwen2;
 pub mod sampling;
 
