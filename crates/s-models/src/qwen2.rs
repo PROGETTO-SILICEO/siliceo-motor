@@ -101,8 +101,9 @@ impl Model {
         let mut gguf = GgufFile::open(path).map_err(|e| e.to_string())?;
         let config = Config::from_gguf(&gguf)?;
         eprintln!(
-            "load: {} layer, {} embd, {} heads ({} kv), {} ffn",
-            config.n_layers, config.n_embd, config.n_heads, config.n_kv_heads, config.n_ff
+            "load: {} layer, {} embd, {} heads ({} kv), {} ffn, eps={}, theta={}",
+            config.n_layers, config.n_embd, config.n_heads, config.n_kv_heads, config.n_ff,
+            config.rms_eps, config.rope_theta
         );
 
         let tok_embd = dequant_tensor(&mut gguf, "token_embd.weight")?;
@@ -138,6 +139,165 @@ impl Model {
             }
         }
         Ok(Self { config, tok_embd, output, output_norm, layers })
+    }
+
+    /// Forward con traccia diagnostica su stderr (per il debug parity).
+    pub fn forward_traced(&self, tokens: &[u32]) -> Vec<f32> {
+        let c = &self.config;
+        let seq = tokens.len();
+        let (ne, hd) = (c.n_embd, c.head_dim);
+        let kv_dim = c.n_kv_heads * hd;
+
+        fn stats(tag: &str, x: &[f32]) {
+            let mut min = f32::INFINITY;
+            let mut max = f32::NEG_INFINITY;
+            let mut sum = 0.0f64;
+            let mut nan = 0usize;
+            let mut inf = 0usize;
+            let mut huge = 0usize;
+            for &v in x {
+                if v.is_nan() { nan += 1; continue; }
+                if v.is_infinite() { inf += 1; continue; }
+                if v.abs() > 1e6 { huge += 1; }
+                min = min.min(v);
+                max = max.max(v);
+                sum += (v as f64).abs();
+            }
+            eprintln!(
+                "{:<28} min={min:+.4e} max={max:+.4e} |m|={:.4e} nan={nan} inf={inf} >1e6={huge}",
+                tag,
+                (sum / x.len() as f64) as f32
+            );
+        }
+
+        // embedding lookup
+        let mut x = vec![0.0f32; seq * ne];
+        for (s, &t) in tokens.iter().enumerate() {
+            let off = t as usize * ne;
+            x[s * ne..(s + 1) * ne].copy_from_slice(&self.tok_embd[off..off + ne]);
+        }
+        stats("embedding", &x);
+        if let Some(&t0) = tokens.first() {
+            let off = t0 as usize * ne;
+            eprintln!("emb[{}][0..6]={:?}", t0, &self.tok_embd[off..off + 6]);
+        }
+
+        // statistiche pesi per layer 0
+        {
+            let l = &self.layers[0];
+            for (name, w) in [
+                ("attn_norm", &l.attn_norm), ("wq", &l.wq), ("bq", &l.bq),
+                ("wv", &l.wv), ("wo", &l.wo), ("w_gate", &l.w_gate),
+                ("w_up", &l.w_up), ("w_down", &l.w_down),
+            ] {
+                stats(&format!("pesi blk0.{name}"), w);
+            }
+        }
+
+        let mut normed = vec![0.0f32; seq * ne];
+        let mut q = vec![0.0f32; seq * ne];
+        let mut k = vec![0.0f32; seq * kv_dim];
+        let mut v = vec![0.0f32; seq * kv_dim];
+        let mut attn_scores = vec![0.0f32; seq];
+        let mut attn_out = vec![0.0f32; seq * ne];
+        let mut tmp1 = vec![0.0f32; seq * c.n_ff.max(ne)];
+        let mut tmp2 = vec![0.0f32; seq * c.n_ff.max(ne)];
+
+        for (li, layer) in self.layers.iter().enumerate() {
+            rmsnorm_into(&x, &mut normed, seq, ne, &layer.attn_norm, c.rms_eps);
+
+            matmul_rows(&layer.wq, ne, ne, &normed, seq, &mut q);
+            matmul_rows(&layer.wk, kv_dim, ne, &normed, seq, &mut k);
+            matmul_rows(&layer.wv, kv_dim, ne, &normed, seq, &mut v);
+            add_bias_rows(&mut q, &layer.bq, seq, ne);
+            add_bias_rows(&mut k, &layer.bk, seq, kv_dim);
+            add_bias_rows(&mut v, &layer.bv, seq, kv_dim);
+            if li == 0 {
+                eprintln!("L0 attn_norm[0..4]={:?} len={}", &layer.attn_norm[0..4], layer.attn_norm.len());
+                stats("L0 normed", &normed);
+                eprintln!("L0 normed[0..6]={:?}", &normed[0..6]);
+                eprintln!("L0 k[0..6]={:?} v[0..6]={:?}", &k[0..6], &v[0..6]);
+            }
+            if li == 0 || li == self.layers.len() - 1 {
+                stats(&format!("L{li} q"), &q);
+                stats(&format!("L{li} k"), &k);
+                stats(&format!("L{li} v"), &v);
+            }
+
+            rope_norm(&mut q, seq, c.n_heads, hd, c.rope_theta);
+            rope_norm(&mut k, seq, c.n_kv_heads, hd, c.rope_theta);
+
+            let heads_per_kv = c.n_heads / c.n_kv_heads;
+            let scale = 1.0 / (hd as f32).sqrt();
+            for s in 0..seq {
+                for h in 0..c.n_heads {
+                    let kvh = h / heads_per_kv;
+                    for t in 0..=s {
+                        let q_off = (s * ne) + h * hd;
+                        let k_off = (t * kv_dim) + kvh * hd;
+                        let mut dot = 0.0f32;
+                        for d in 0..hd {
+                            dot += q[q_off + d] * k[k_off + d];
+                        }
+                        attn_scores[t] = dot * scale;
+                    }
+                    softmax_row(&mut attn_scores[..=s]);
+                    let o_off = (s * ne) + h * hd;
+                    for d in 0..hd {
+                        attn_out[o_off + d] = 0.0;
+                    }
+                    for t in 0..=s {
+                        let w = attn_scores[t];
+                        let v_off = (t * kv_dim) + kvh * hd;
+                        for d in 0..hd {
+                            attn_out[o_off + d] += w * v[v_off + d];
+                        }
+                    }
+                }
+            }
+
+            matmul_rows(&layer.wo, ne, ne, &attn_out, seq, &mut tmp1);
+            for i in 0..seq * ne {
+                x[i] += tmp1[i];
+            }
+            if li == 0 || li == self.layers.len() - 1 {
+                stats(&format!("L{li} dopo attn+res"), &x);
+            }
+
+            rmsnorm_into(&x, &mut normed, seq, ne, &layer.ffn_norm, c.rms_eps);
+            let gate = &mut tmp1[..seq * c.n_ff];
+            matmul_rows(&layer.w_gate, c.n_ff, ne, &normed, seq, gate);
+            let up = &mut tmp2[..seq * c.n_ff];
+            matmul_rows(&layer.w_up, c.n_ff, ne, &normed, seq, up);
+            for i in 0..seq * c.n_ff {
+                gate[i] = silu(gate[i]) * up[i];
+            }
+            let down = &mut tmp2[..seq * ne];
+            matmul_rows(&layer.w_down, ne, c.n_ff, gate, seq, down);
+            for i in 0..seq * ne {
+                x[i] += down[i];
+            }
+            if li < 3 || li >= self.layers.len() - 2 {
+                stats(&format!("L{li} dopo ffn+res"), &x);
+            }
+        }
+
+        let mut last = vec![0.0f32; ne];
+        last.copy_from_slice(&x[(seq - 1) * ne..seq * ne]);
+        let last = rmsnorm_row(&last, &self.output_norm, c.rms_eps);
+        stats("final norm", &last);
+
+        let mut logits = vec![0.0f32; c.vocab_size];
+        for o in 0..c.vocab_size {
+            let w_off = o * ne;
+            let mut sum = 0.0f32;
+            for d in 0..ne {
+                sum += self.output[w_off + d] * last[d];
+            }
+            logits[o] = sum;
+        }
+        stats("logits", &logits);
+        logits
     }
 
     /// Forward: token IDs → logits [vocab].
@@ -298,19 +458,22 @@ fn add_bias_rows(y: &mut [f32], b: &[f32], seq: usize, n: usize) {
     }
 }
 
-/// RoPE stile NORM (interleaved): coppia (2i, 2i+1) ruotata di angle = pos * theta^(-2i/d).
+/// RoPE stile NEOX (half-split): coppia (i, i+hd/2) ruotata di angle = pos * theta^(-2i/d).
+/// Verificato empiricamente su Qwen2.5: top-5 logits identico a llama.cpp
+/// (lo stile interleaved/NORM dà top-1 diverso già dal primo token generato).
 fn rope_norm(x: &mut [f32], seq: usize, n_heads: usize, hd: usize, theta: f32) {
+    let half = hd / 2;
     for s in 0..seq {
         for h in 0..n_heads {
             let base = (s * n_heads + h) * hd;
-            for i in 0..hd / 2 {
+            for i in 0..half {
                 let freq = (theta).powf(-(2.0 * i as f32) / hd as f32);
                 let angle = s as f32 * freq;
                 let (sin, cos) = angle.sin_cos();
-                let x0 = x[base + 2 * i];
-                let x1 = x[base + 2 * i + 1];
-                x[base + 2 * i] = x0 * cos - x1 * sin;
-                x[base + 2 * i + 1] = x0 * sin + x1 * cos;
+                let x0 = x[base + i];
+                let x1 = x[base + i + half];
+                x[base + i] = x0 * cos - x1 * sin;
+                x[base + i + half] = x0 * sin + x1 * cos;
             }
         }
     }

@@ -58,17 +58,24 @@ pub fn dequant_q8_0(block: &[u8], out: &mut [f32]) {
 
 /// Dequantizza un blocco Q5_0 (22 byte → 32 f32).
 /// Layout: [d:fp16][qh:4 byte][qs:16 byte nibbles].
-/// Bit alti da ggml-quants.c: per il valore l, byte qh[l/4], bit l%4
-/// (xh_0) e bit l%4+4 (xh_1). Valore = (nibble - bit_alto*16) * d.
+/// Formula (verificata contro gguf-py ufficiale + pesi HF Qwen2.5, corr 0.9992):
+/// q_v = (nibble_v | bit_v<<4) − 16, dove bit_v è il bit v dell'u32
+/// little-endian formato dai 4 byte qh. Nibble: low di qs[v] per v<16,
+/// high di qs[v−16] per v≥16. y = d*q.
 pub fn dequant_q5_0(block: &[u8], out: &mut [f32]) {
     let d = fp16_to_f32(block[0] as u16 | ((block[1] as u16) << 8));
-    let qh = &block[2..6];
+    let qh_u32 = block[2] as u32
+        | ((block[3] as u32) << 8)
+        | ((block[4] as u32) << 16)
+        | ((block[5] as u32) << 24);
     let qs = &block[6..22];
     for l in 0..16 {
-        let xh_0 = (((qh[l >> 2] >> (l & 3)) & 1) << 4) as i32;
-        let xh_1 = (((qh[l >> 2] >> ((l & 3) | 4)) & 1) << 4) as i32;
-        out[l] = d * (((qs[l] & 0x0F) as i32 - xh_0) as f32);
-        out[l + 16] = d * (((qs[l] >> 4) as i32 - xh_1) as f32);
+        let hi_lo = (((qh_u32 >> l) & 1) << 4) as i32;
+        let hi_hi = (((qh_u32 >> (l + 16)) & 1) << 4) as i32;
+        let q_lo = ((qs[l] & 0x0F) as i32 | hi_lo) - 16;
+        let q_hi = ((qs[l] >> 4) as i32 | hi_hi) - 16;
+        out[l] = d * q_lo as f32;
+        out[l + 16] = d * q_hi as f32;
     }
 }
 
@@ -102,19 +109,19 @@ pub fn dequant_q4_k(block: &[u8], out: &mut [f32]) {
     }
 }
 
-/// Dequantizza un blocco Q6_K (210 byte → 256 f32). Layout: [d:fp16][ql:128]
-/// [qh:64][scales:16×i8]. Formula dequantize_row_q6_K: q centrato su 32.
+/// Dequantizza un blocco Q6_K (210 byte → 256 f32).
+/// Layout UFFICIALE (gguf-py/ggml, verificato su file reale):
+/// [ql:128][qh:64][scales:16×i8][d:fp16] — la scala d sta ALLA FINE del blocco.
+/// q centrato su 32, scala di gruppo = d * sc[v/16].
 pub fn dequant_q6_k(block: &[u8], out: &mut [f32]) {
-    let d = fp16_to_f32(block[0] as u16 | ((block[1] as u16) << 8));
-    // Righe morte (d NaN/inf dalla quantizzazione reale) → zero, niente NaN
-    // propagato (metodo Exo: accetta l'imperfezione del file).
+    let ql = &block[0..128];
+    let qh = &block[128..192];
+    let sc = &block[192..208];
+    let d = fp16_to_f32(block[208] as u16 | ((block[209] as u16) << 8));
     if !d.is_finite() {
         out[..256].fill(0.0);
         return;
     }
-    let ql = &block[2..130];
-    let qh = &block[130..194];
-    let sc = &block[194..210];
 
     let mut yoff = 0usize;
     for n in 0..2 {

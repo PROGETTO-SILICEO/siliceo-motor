@@ -9,6 +9,7 @@ fn main() {
     let model = Model::load(&path).unwrap();
 
     let mut ids = tok.encode(&prompt).unwrap();
+    eprintln!("IDS={:?}", ids);
     println!("prompt: {prompt:?} -> {:?} ids", ids.len());
 
     for _ in 0..12 {
@@ -28,3 +29,4 @@ fn main() {
     }
     println!();
 }
+// stampa anche gli id del prompt su stderr
