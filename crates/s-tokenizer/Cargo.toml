@@ -6,3 +6,6 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+s-gguf = { path = "../s-gguf" }
+thiserror = "2"
+fancy-regex = "0.14"
