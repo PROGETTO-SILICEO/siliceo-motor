@@ -1,0 +1,30 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/s-types",
+    "crates/s-gguf",
+    "crates/s-tokenizer",
+    "crates/s-backend",
+    "crates/s-backend-cpu",
+    "crates/s-backend-cuda",
+    "crates/s-backend-vulkan",
+    "crates/s-models",
+    "crates/s-kv",
+    "crates/s-speculative",
+    "crates/s-server",
+    "crates/s-voice",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Sempre <Progetto Siliceo>"]
+
+[workspace.lints.rust]
+unsafe_code = "warn"
+
+[profile.release]
+opt-level = 3
+lto = "thin"
+codegen-units = 1
