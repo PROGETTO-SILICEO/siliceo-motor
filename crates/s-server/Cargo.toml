@@ -10,6 +10,7 @@ name = "s-server"
 path = "src/main.rs"
 
 [dependencies]
+s-config = { path = "../s-config" }
 s-models = { path = "../s-models" }
 s-tokenizer = { path = "../s-tokenizer" }
 s-gguf = { path = "../s-gguf" }

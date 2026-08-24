@@ -2,6 +2,7 @@
 resolver = "2"
 members = [
     "crates/s-types",
+    "crates/s-config",
     "crates/s-gguf",
     "crates/s-tokenizer",
     "crates/s-backend",

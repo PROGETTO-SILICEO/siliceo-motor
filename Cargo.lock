@@ -95,6 +95,10 @@ name = "s-backend-vulkan"
 version = "0.1.0"
 
 [[package]]
+name = "s-config"
+version = "0.1.0"
+
+[[package]]
 name = "s-gguf"
 version = "0.1.0"
 dependencies = [
@@ -117,6 +121,7 @@ dependencies = [
 name = "s-server"
 version = "0.1.0"
 dependencies = [
+ "s-config",
  "s-gguf",
  "s-models",
  "s-tokenizer",

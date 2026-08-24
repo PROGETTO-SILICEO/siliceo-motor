@@ -1,9 +1,5 @@
-//! JSON minimale per s-server — parser e serializzatore scritti in casa.
-//!
-//! Scope F2: basta per le richieste OpenAI-compatible
-//! (`messages`, `temperature`, `top_p`, `top_k`, `max_tokens`, `stop`, `seed`)
-//! e per comporre le risposte. Niente numeri esponenziali in parsing
-//! (non servono per i parametri previsti), escape \u completo con surrogate.
+//! JSON minimale — parser e serializzatore scritti in casa (D6: spostato qui
+//! da s-server perché serve sia alla configurazione sia alle richieste).
 
 use std::fmt::Write as _;
 

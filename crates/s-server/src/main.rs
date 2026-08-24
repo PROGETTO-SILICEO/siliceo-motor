@@ -1,42 +1,102 @@
-//! s-server — server di inferenza CPU end-to-end per siliceo-motor (F2).
+//! s-server — server di inferenza CPU end-to-end per siliceo-motor (F2 + D6).
 //!
 //! Endpoint OpenAI-compatible:
 //!   GET  /health
 //!   POST /v1/completions        {prompt, temperature?, top_p?, top_k?, max_tokens?, stop?, seed?}
 //!   POST /v1/chat/completions   {messages:[{role,content}], ...stessi parametri}
 //!
-//! Zero dipendenze HTTP/JSON: std::net + parser scritto in casa.
-//! Uso: s-server <modello.gguf> [--port N]
+//! Configurazione dinamica (D6):
+//!   GET  /v1/config             config effettiva (strati fusi)
+//!   POST /v1/config             patch dei default di generazione A SERVER ACCESO
+//!
+//! Strati (dal più debole al più forte): default < motor.json < flag CLI <
+//! parametri della singola richiesta.
+//!
+//! Zero dipendenze HTTP/JSON: std::net + parser scritto in casa (in s-config).
+//! Uso: s-server [modello.gguf] [--config PATH] [--port N] [--host H]
+//!      se non c'è --config e esiste ./motor.json viene caricato da solo.
 
 mod http;
-mod json;
 
-use json::{parse, Json};
+use s_config::json::{parse, write_escaped, Json};
+use s_config::{FileConfig, GenerateDefaults};
 use s_models::generate::{generate, GenerateParams};
 use s_models::Model;
 use s_tokenizer::Tokenizer;
+use std::fmt::Write as _;
 use std::net::{TcpListener, TcpStream};
-use std::sync::Arc;
+use std::sync::{Arc, RwLock};
 
 struct App {
     model: Model,
     tok: Tokenizer,
     im_end_id: Option<u32>,
     model_name: String,
+    /// Default di generazione correnti (risolti: temperatura/max_tokens sempre presenti).
+    /// Mutabili a runtime via POST /v1/config.
+    gen_defaults: RwLock<GenerateDefaults>,
+    /// Cosa riportare in GET /v1/config sulla sezione server.
+    server_report: (String, u16),
 }
 
 fn main() {
+    // ── strato 4: riga di comando ──
     let mut args = std::env::args().skip(1);
-    let model_path = args.next().unwrap_or_else(|| {
-        eprintln!("uso: s-server <modello.gguf> [--port N]");
-        std::process::exit(1);
-    });
-    let mut port: u16 = 8096;
+    let mut positional_model: Option<String> = None;
+    let mut config_path: Option<String> = None;
+    let mut cli_port: Option<u16> = None;
+    let mut cli_host: Option<String> = None;
     while let Some(a) = args.next() {
-        if a == "--port" {
-            port = args.next().and_then(|p| p.parse().ok()).unwrap_or(port);
+        match a.as_str() {
+            "--config" => config_path = args.next(),
+            "--port" => cli_port = args.next().and_then(|p| p.parse().ok()),
+            "--host" => cli_host = args.next(),
+            "--model" => positional_model = args.next(),
+            other => {
+                if positional_model.is_none() && !other.starts_with('-') {
+                    positional_model = Some(other.into());
+                } else {
+                    eprintln!("uso: s-server [modello.gguf] [--config PATH] [--port N] [--host H]");
+                    std::process::exit(1);
+                }
+            }
         }
     }
+
+    // ── strati 2+3: sistema < utente ──
+    let mut file_cfg = FileConfig::default();
+    let percorso = config_path.clone().or_else(|| {
+        // auto-discovery: prima ./motor.json, poi il percorso di sistema
+        ["motor.json", "/etc/siliceo-motor/motor.json"]
+            .iter()
+            .find(|p| std::path::Path::new(p).exists())
+            .map(|p| p.to_string())
+    });
+    if let Some(p) = &percorso {
+        match std::fs::read_to_string(p).map_err(|e| e.to_string()).and_then(|t| FileConfig::parse(&t)) {
+            Ok(c) => {
+                eprintln!("s-server: config da {p}");
+                file_cfg = c;
+            }
+            Err(e) => {
+                eprintln!("s-server: ERRORE nella config {p}: {e}");
+                std::process::exit(1);
+            }
+        }
+    }
+
+    let model_path = positional_model.or(file_cfg.model_path.clone()).unwrap_or_else(|| {
+        eprintln!("uso: s-server <modello.gguf> [--config PATH] [--port N] [--host H]");
+        std::process::exit(1);
+    });
+
+    // precedenza: CLI > file > default
+    let port = cli_port.or(file_cfg.server.port).unwrap_or(8096);
+    let host =
+        cli_host.or(file_cfg.server.host.clone()).unwrap_or_else(|| "127.0.0.1".into());
+
+    // default di generazione risolti: assoluti < file (la CLI non tocca la generazione)
+    let gen0 = GenerateDefaults::default().merge(&file_cfg.generate);
 
     eprintln!("s-server: carico {model_path} ...");
     let t0 = std::time::Instant::now();
@@ -50,10 +110,12 @@ fn main() {
             .unwrap_or_else(|| model_path.clone()),
         tok,
         model,
+        gen_defaults: RwLock::new(gen0),
+        server_report: (host.clone(), port),
     });
     eprintln!("s-server: modello pronto in {:.1}s", t0.elapsed().as_secs_f32());
 
-    let addr = format!("127.0.0.1:{port}");
+    let addr = format!("{host}:{port}");
     let listener = TcpListener::bind(&addr).expect("bind");
     eprintln!("s-server: in ascolto su http://{addr}");
 
@@ -83,14 +145,69 @@ fn handle(app: &App, stream: &mut TcpStream) {
     match (req.method.as_str(), path.as_str()) {
         ("GET", "/health") => {
             let mut buf = String::from("{\"status\":\"ok\",\"model\":");
-            json::write_escaped(&mut buf, &app.model_name);
+            write_escaped(&mut buf, &app.model_name);
             buf.push('}');
             respond(stream, 200, &buf);
         }
+        ("GET", "/v1/config") => get_config(app, stream),
+        ("POST", "/v1/config") => patch_config(app, stream, &req.body),
         ("POST", "/v1/chat/completions") => chat_completions(app, stream, &req.body),
         ("POST", "/v1/completions") => completions(app, stream, &req.body),
         _ => error(stream, 404, format!("endpoint sconosciuto: {} {}", req.method, req.path)),
     }
+}
+
+// ── configurazione dinamica (D6) ──
+
+fn get_config(app: &App, stream: &mut TcpStream) {
+    let g = app.gen_defaults.read().unwrap();
+    let mut buf = String::from("{\"server\":{");
+    buf.push_str("\"host\":");
+    write_escaped(&mut buf, &app.server_report.0);
+    let _ = write!(buf, ",\"port\":{}}},\"generate\":{{", app.server_report.1);
+    let _ = write!(buf, "\"temperature\":{}", g.temperature.unwrap_or(0.0));
+    match g.top_p {
+        Some(v) => { let _ = write!(buf, ",\"top_p\":{v}"); }
+        None => buf.push_str(",\"top_p\":null"),
+    }
+    match g.top_k {
+        Some(v) => { let _ = write!(buf, ",\"top_k\":{v}"); }
+        None => buf.push_str(",\"top_k\":null"),
+    }
+    let _ = write!(buf, ",\"max_tokens\":{}}}", g.max_tokens.unwrap_or(256));
+    buf.push('}');
+    drop(g);
+    respond(stream, 200, &buf);
+}
+
+/// Patch dei default di generazione a server acceso.
+/// Accetta sia `{"temperature":0.7}` sia `{"generate":{"temperature":0.7}}`.
+fn patch_config(app: &App, stream: &mut TcpStream, body: &[u8]) {
+    let text = match std::str::from_utf8(body) {
+        Ok(t) => t,
+        Err(_) => return error(stream, 400, "body non è UTF-8"),
+    };
+    // accetta anche la forma annidata {"generate":{...}}
+    let effettivo = match parse(text)
+        .map_err(|e| format!("JSON non valido: {e}"))
+        .and_then(|j| {
+            if j.get("generate").is_some() {
+                FileConfig::from_json(&j).map(|c| c.generate)
+            } else {
+                GenerateDefaults::patch_from_str(text)
+            }
+        }) {
+        Ok(patch) => patch,
+        Err(e) => return error(stream, 400, e),
+    };
+
+    let nuovo = {
+        let correnti = app.gen_defaults.read().unwrap();
+        correnti.merge(&effettivo)
+    };
+    *app.gen_defaults.write().unwrap() = nuovo.clone();
+    let _ = nuovo; // la risposta la costruiamo rileggendo (semplice e senza lock doppio)
+    get_config(app, stream);
 }
 
 // ── endpoint ──
@@ -104,7 +221,7 @@ fn completions(app: &App, stream: &mut TcpStream, body: &[u8]) {
         Some(p) => p.to_string(),
         None => return error(stream, 400, "campo 'prompt' mancante o non stringa"),
     };
-    let params = match params_from_json(&j) {
+    let params = match params_from_json(app, &j) {
         Ok(p) => p,
         Err(e) => return error(stream, 400, e),
     };
@@ -131,7 +248,7 @@ fn chat_completions(app: &App, stream: &mut TcpStream, body: &[u8]) {
         Ok(p) => p,
         Err(e) => return error(stream, 400, e),
     };
-    let params = match params_from_json(&j) {
+    let params = match params_from_json(app, &j) {
         Ok(p) => p,
         Err(e) => return error(stream, 400, e),
     };
@@ -168,8 +285,18 @@ fn parse_body(body: &[u8]) -> Result<Json, String> {
     parse(text)
 }
 
-fn params_from_json(j: &Json) -> Result<GenerateParams, String> {
-    let mut p = GenerateParams::default();
+fn params_from_json(app: &App, j: &Json) -> Result<GenerateParams, String> {
+    // strato 5: la richiesta parte dai default correnti (strato 6, mutabili via /v1/config)
+    let base = app.gen_defaults.read().unwrap().clone();
+    let mut p = GenerateParams {
+        max_tokens: base.max_tokens.unwrap_or(256),
+        temperature: base.temperature.unwrap_or(0.0),
+        top_k: base.top_k,
+        top_p: base.top_p,
+        seed: None,
+        stop: Vec::new(),
+        extra_eos: Vec::new(),
+    };
     if let Some(v) = j.get("temperature") {
         p.temperature = v.as_f64().ok_or("temperature non numerica")? as f32;
     }
@@ -229,7 +356,7 @@ fn respond(stream: &mut TcpStream, status: u16, body: &str) {
 
 fn error(stream: &mut TcpStream, status: u16, msg: impl std::fmt::Display) {
     let mut buf = String::from("{\"error\":");
-    json::write_escaped(&mut buf, &msg.to_string());
+    write_escaped(&mut buf, &msg.to_string());
     buf.push('}');
     respond(stream, status, &buf);
 }
@@ -259,11 +386,11 @@ fn respond_json_completion(
 ) {
     let mut buf = String::new();
     buf.push_str("{\"id\":");
-    json::write_escaped(&mut buf, &completion_id());
+    write_escaped(&mut buf, &completion_id());
     buf.push_str(",\"object\":\"text_completion\",\"choices\":[{\"text\":");
-    json::write_escaped(&mut buf, text);
+    write_escaped(&mut buf, text);
     buf.push_str(",\"finish_reason\":");
-    json::write_escaped(&mut buf, finish_reason);
+    write_escaped(&mut buf, finish_reason);
     buf.push_str("}],");
     buf.push_str(&usage_json(prompt_tokens, out));
     buf.push('}');
@@ -279,11 +406,11 @@ fn respond_json_chat(
 ) {
     let mut buf = String::new();
     buf.push_str("{\"id\":");
-    json::write_escaped(&mut buf, &completion_id());
+    write_escaped(&mut buf, &completion_id());
     buf.push_str(",\"object\":\"chat.completion\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":");
-    json::write_escaped(&mut buf, text);
+    write_escaped(&mut buf, text);
     buf.push_str("},\"finish_reason\":");
-    json::write_escaped(&mut buf, finish_reason);
+    write_escaped(&mut buf, finish_reason);
     buf.push_str("}],");
     buf.push_str(&usage_json(prompt_tokens, out));
     buf.push('}');
