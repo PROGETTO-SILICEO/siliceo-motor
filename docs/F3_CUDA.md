@@ -29,19 +29,29 @@ llama.cpp fa lo stesso da anni; lo facciamo con kernels nostri (D1).
   compilabile ovunque senza toolchain NVIDIA (CI e repo pubblica inclusi).
 
 ### F3b — forward f16/f32 su GPU, parity (prima settimana su hardware)
-Requisito: accesso SSH al centro-operativo (RTX 3090) o nodo inferenza (2070).
-- CudaCtx: init driver, device, stream, errori gestiti (mai panic in serving).
-- Upload pesi f32 (0.5B ≈ 2 GB: ok) residente su device; token IDs in, logits out.
-- Kernels minimi, UNO ALLA VOLTA con parity contro CPU:
-  1. matmul naive f32 (y = x@W^T)
-  2. rmsnorm
-  3. RoPE NEOX half-split (posizioni assolute — stesso schema di F2.5)
-  4. softmax causale per-head (GQA)
-  5. silu-mul fused
-  6. add residuo
-- KV cache su device, stessa semantica posizioni assolute di KvCache.
-- **Verifica F3b**: generazione greedy multi-token su 0.5B == output CPU
-  al byte (o tolleranza documentata se f16), server end-to-end su GPU.
+Hardware: banco di prova RTX 3090 24GB, CUDA 12.4.
+Build+test: `bash scripts/test-cuda-ai3.sh`.
+
+FATTO (25/08):
+- ✅ CudaCtx (init driver, contesto primario, describe per /health)
+- ✅ Pipeline D1 SOVRANA OPERATIVA: kernel Rust → rustc_codegen_nvvm → PTX
+  → ptxas → cubin → cust launch. Nightly pinnato 2026-04-02.
+- ✅ Kernel Rust `vec_add_f32` e `matmul_wt_f32` in kernels/src/lib.rs
+- ✅ PARITY matmul GPU vs CPU verificata su 3090 (max_err < 1e-3,
+  stessa semantica di matmul_rows di s-models)
+- Scoperte ambientali documentate nel ledger: driver senza JIT PTX
+  (→ precompilazione obbligatoria), find_cuda_helper/CUDA_PATH quirks,
+  cuda_std non utilizzabile (half+std) → dipendiamo SOLO da cuda_std_macros
+  e usiamo gli intrinsics nativi core::arch::nvptx.
+
+PROSSIMO (restante F3b):
+- [ ] rmsnorm kernel + parity
+- [ ] RoPE NEOX half-split con posizioni assolute + parity
+- [ ] softmax causale GQA fused + parity
+- [ ] silu-mul fused, add residuo + parity
+- [ ] Pesi residenti su device (0.5B f32), KV cache su device
+- [ ] forward completo qwen2 su GPU == output CPU al byte
+- **Verifica F3b**: generazione greedy multi-token su 0.5B identica via server
 
 ### F3c — quantizzazione on-device (il salto)
 - Q8_0 prima (semplice: blocchi 32, scala fp16): fused dequant-matmul.

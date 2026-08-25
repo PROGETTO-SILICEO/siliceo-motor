@@ -12,5 +12,15 @@ s-models = { path = "../s-models" }
 # libcuda a link-time → mai dipendenza di default finché non serve.
 cust = { version = "0.3", optional = true }
 
+[build-dependencies]
+# cuda_builder (git, NON crates.io: la versione registry è ferma al 2022).
+# La feature compila rustc_codegen_nvvm contro gli interni del nightly
+# pinnato → build SOLO con `cargo +nightly-2026-04-02 --features cuda`.
+cuda_builder = { git = "https://github.com/Rust-GPU/Rust-CUDA", features = ["rustc_codegen_nvvm"], optional = true }
+# Feature unification: il build-script di rustc_codegen_nvvm usa curl per
+# scaricare LLVM precompilato; sui nodi manca libssl-dev (e niente sudo).
+# `vendored` fa compilare OpenSSL da sorgente dentro la build graph.
+openssl-sys = { version = "0.9", optional = true, features = ["vendored"] }
+
 [features]
-cuda = ["dep:cust"]
+cuda = ["dep:cust", "dep:cuda_builder", "dep:openssl-sys"]

@@ -1,0 +1,5 @@
+[toolchain]
+# PINNATO: rustc_codegen_nvvm compila contro interni di rustc.
+# Deve combaciare con la revisione di Rust-GPU/Rust-CUDA usata dalle dipendenze.
+channel = "nightly-2026-04-02"
+components = ["rust-src", "rustc-dev", "llvm-tools-preview"]

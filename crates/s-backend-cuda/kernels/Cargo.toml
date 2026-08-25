@@ -1,0 +1,24 @@
+[package]
+name = "s-cuda-kernels"
+version = "0.1.0"
+edition = "2024"
+license = "MIT OR Apache-2.0"
+authors = ["Sempre <Progetto Siliceo>"]
+publish = false
+
+# Crate dei kernel GPU — NON è un membro del workspace (escluso nel Cargo.toml
+# radice): viene compilato da cuda_builder con target nvptx64-nvidia-cuda e
+# -Zbuild-std, con il nightly pinnato in rust-toolchain.toml
+# (rustc_codegen_nvvm usa interni di rustc: la versione deve combaciare).
+
+[dependencies]
+# Solo la proc-macro: niente cuda_std (tira half con feature std → non
+# compila su nvptx). Gli intrinsics thread/block sono in core::arch::nvptx.
+cuda_std_macros = { git = "https://github.com/Rust-GPU/Rust-CUDA" }
+
+[lib]
+crate-type = ["cdylib", "rlib"]
+
+# Crate radice di un workspace proprio: non deve mai essere assorbito
+# dal workspace padre (compilato con target/toolchain diversi).
+[workspace]

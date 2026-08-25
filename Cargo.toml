@@ -15,6 +15,9 @@ members = [
     "crates/s-server",
     "crates/s-voice",
 ]
+# I kernel GPU sono un crate a sé: compilato da cuda_builder con target
+# nvptx64 e nightly pinnato (vedi crates/s-backend-cuda/kernels/).
+exclude = ["crates/s-backend-cuda/kernels"]
 
 [workspace.package]
 version = "0.1.0"
