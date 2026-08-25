@@ -12,8 +12,13 @@ publish = false
 # (rustc_codegen_nvvm usa interni di rustc: la versione deve combaciare).
 
 [dependencies]
-# Solo la proc-macro: niente cuda_std (tira half con feature std → non
-# compila su nvptx). Gli intrinsics thread/block sono in core::arch::nvptx.
+# Matematica via crate `libm`: sul target nvptx i metodi di f32 NON esistono
+# in core (arrivano da std, che nvptx non ha). rustc_codegen_nvvm fa il
+# "libm override": le chiamate a libm vengono riscritte con gli intrinsic
+# libdevice (__nv_*) al codegen — niente std, niente half, niente cuda_std.
+# Su host libm è l'implementazione di riferimento: stessi algoritmi dei
+# test di parity CPU.
+libm = "0.2"
 cuda_std_macros = { git = "https://github.com/Rust-GPU/Rust-CUDA" }
 
 [lib]

@@ -96,7 +96,7 @@ mod smoke {
             Ok(Self { _ctx: ctx, module, stream })
         }
 
-        fn function(&self, name: &str) -> Result<cust::function::Function, String> {
+        fn function(&self, name: &str) -> Result<cust::function::Function<'_>, String> {
             self.module.get_function(name).map_err(|e| err("get_function", e))
         }
     }
@@ -212,5 +212,279 @@ mod smoke {
             max_err = max_err.max((g - e).abs());
         }
         assert!(max_err < 1e-3, "parity matmul: max_err={max_err}");
+    }
+
+    // ── riferimenti CPU: repliche fedeli delle primitive di s-models
+    // (rmsnorm_into / rope_norm_offset / softmax_row / silu) ──
+
+    fn rmsnorm_cpu(x: &[f32], w: &[f32], seq: usize, n: usize, eps: f32) -> Vec<f32> {
+        let mut out = vec![0.0f32; seq * n];
+        for s in 0..seq {
+            let row = &x[s * n..(s + 1) * n];
+            let mut ss = 0.0f32;
+            for &v in row {
+                ss += v * v;
+            }
+            let inv = 1.0 / (ss / n as f32 + eps).sqrt();
+            for i in 0..n {
+                out[s * n + i] = row[i] * inv * w[i];
+            }
+        }
+        out
+    }
+
+    fn rope_neox_cpu(
+        x: &mut [f32],
+        seq: usize,
+        n_heads: usize,
+        hd: usize,
+        theta: f32,
+        pos0: usize,
+    ) {
+        let half = hd / 2;
+        for s in 0..seq {
+            for h in 0..n_heads {
+                let base = (s * n_heads + h) * hd;
+                for i in 0..half {
+                    let freq = theta.powf(-(2.0 * i as f32) / hd as f32);
+                    let angle = (s + pos0) as f32 * freq;
+                    let (sin, cos) = angle.sin_cos();
+                    let x0 = x[base + i];
+                    let x1 = x[base + i + half];
+                    x[base + i] = x0 * cos - x1 * sin;
+                    x[base + i + half] = x0 * sin + x1 * cos;
+                }
+            }
+        }
+    }
+
+    fn softmax_rows_cpu(x: &mut [f32], rows: usize, n: usize) {
+        for r in 0..rows {
+            let row = &mut x[r * n..(r + 1) * n];
+            let mut max = f32::NEG_INFINITY;
+            for &v in row.iter() {
+                if v > max {
+                    max = v;
+                }
+            }
+            let mut sum = 0.0f32;
+            for v in row.iter_mut() {
+                *v = (*v - max).exp();
+                sum += *v;
+            }
+            for v in row.iter_mut() {
+                *v /= sum;
+            }
+        }
+    }
+
+    fn silu_mul_cpu(gate: &[f32], up: &[f32]) -> Vec<f32> {
+        gate.iter()
+            .zip(up.iter())
+            .map(|(&g, &u)| g / (1.0 + (-g).exp()) * u)
+            .collect()
+    }
+
+    /// Input deterministico in [-1, 1): LCG semplice, niente dipendenze.
+    fn lcg_input(n: usize, seed: u64) -> Vec<f32> {
+        let mut seed = seed;
+        let mut next = move || {
+            seed = seed.wrapping_mul(6364136223846793005).wrapping_add(1442695040888963407);
+            ((seed >> 33) as f32 / u32::MAX as f32) * 2.0 - 1.0
+        };
+        (0..n).map(|_| next()).collect()
+    }
+
+    #[test]
+    fn rmsnorm_parity_contro_cpu() {
+        const SEQ: usize = 5;
+        const N: usize = 96; // non multiplo del blocco
+        const EPS: f32 = 1e-5; // qwen2.5 rms_eps
+        let gpu = Gpu::new().unwrap();
+        let func = gpu.function("rmsnorm_f32").unwrap();
+
+        let x = lcg_input(SEQ * N, 0xA11CE);
+        let w = lcg_input(N, 0xB0B);
+        // pesi tipo RMSNorm attorno a 1 (come dopo training): [0.5, 1.5)
+        let w: Vec<f32> = w.iter().map(|&v| 1.0 + v / 2.0).collect();
+        let expected = rmsnorm_cpu(&x, &w, SEQ, N, EPS);
+
+        let d_x = DeviceBuffer::from_slice(&x).unwrap();
+        let d_w = DeviceBuffer::from_slice(&w).unwrap();
+        let d_out = DeviceBuffer::<f32>::zeroed(SEQ * N).unwrap();
+
+        let threads = 64;
+        let blocks = (SEQ as u32).div_ceil(threads);
+        let stream = &gpu.stream;
+        unsafe {
+            launch!(
+                func<<<blocks, threads, 0, stream>>>(
+                    d_x.as_device_ptr(),
+                    d_w.as_device_ptr(),
+                    d_out.as_device_ptr(),
+                    SEQ as u32,
+                    N as u32,
+                    EPS
+                )
+            )
+            .map_err(|e| err("launch", e))
+            .unwrap();
+        }
+        gpu.stream.synchronize().map_err(|e| err("sync", e)).unwrap();
+
+        let got = {
+            let mut v = vec![0.0f32; SEQ * N];
+            d_out.copy_to(&mut v).map_err(|e| err("download", e)).unwrap();
+            v
+        };
+        let mut max_err = 0.0f32;
+        for (g, e) in got.iter().zip(expected.iter()) {
+            max_err = max_err.max((g - e).abs());
+        }
+        // stesso ordine di accumulo → atteso quasi bit-exact
+        println!("rmsnorm max_err = {max_err:.3e}");
+        assert!(max_err < 1e-5, "parity rmsnorm: max_err={max_err}");
+    }
+
+    #[test]
+    fn rope_neox_parity_contro_cpu_con_posizione_assoluta() {
+        const SEQ: usize = 3;
+        const HEADS: usize = 4;
+        const HD: usize = 16; // pari, half=8 coppie per testa
+        const THETA: f32 = 1_000_000.0; // qwen2.5 rope_theta
+        const POS0: usize = 97; // posizione assoluta ≠ 0: il caso della cache
+
+        let gpu = Gpu::new().unwrap();
+        let func = gpu.function("rope_neox_f32").unwrap();
+
+        let mut expected = lcg_input(SEQ * HEADS * HD, 0xC0FFEE);
+        let input = expected.clone();
+
+        let d_x = DeviceBuffer::from_slice(&input).unwrap();
+
+        let total = (SEQ * HEADS * (HD / 2)) as u32;
+        let threads = 64;
+        let blocks = total.div_ceil(threads);
+        let stream = &gpu.stream;
+        unsafe {
+            launch!(
+                func<<<blocks, threads, 0, stream>>>(
+                    d_x.as_device_ptr(),
+                    SEQ as u32,
+                    HEADS as u32,
+                    HD as u32,
+                    THETA,
+                    POS0 as u32
+                )
+            )
+            .map_err(|e| err("launch", e))
+            .unwrap();
+        }
+        gpu.stream.synchronize().map_err(|e| err("sync", e)).unwrap();
+
+        rope_neox_cpu(&mut expected, SEQ, HEADS, HD, THETA, POS0);
+
+        let got = {
+            let mut v = vec![0.0f32; SEQ * HEADS * HD];
+            d_x.copy_to(&mut v).map_err(|e| err("download", e)).unwrap();
+            v
+        };
+        // powf/sin/cos di libdevice ≠ libm host: parity a tolleranza
+        let mut max_err = 0.0f32;
+        for (g, e) in got.iter().zip(expected.iter()) {
+            max_err = max_err.max((g - e).abs());
+        }
+        println!("rope_neox max_err = {max_err:.3e}");
+        assert!(max_err < 1e-3, "parity rope_neox: max_err={max_err}");
+    }
+
+    #[test]
+    fn softmax_rows_parity_contro_cpu() {
+        const ROWS: usize = 7;
+        const N: usize = 33;
+        let gpu = Gpu::new().unwrap();
+        let func = gpu.function("softmax_rows_f32").unwrap();
+
+        // punteggi con range realistico d'attenzione: scala * [-1,1)
+        let input: Vec<f32> = lcg_input(ROWS * N, 0x50F7A5).iter().map(|&v| v * 8.0).collect();
+        let mut expected = input.clone();
+        softmax_rows_cpu(&mut expected, ROWS, N);
+
+        let d_x = DeviceBuffer::from_slice(&input).unwrap();
+
+        let threads = 32;
+        let blocks = (ROWS as u32).div_ceil(threads);
+        let stream = &gpu.stream;
+        unsafe {
+            launch!(
+                func<<<blocks, threads, 0, stream>>>(
+                    d_x.as_device_ptr(),
+                    ROWS as u32,
+                    N as u32
+                )
+            )
+            .map_err(|e| err("launch", e))
+            .unwrap();
+        }
+        gpu.stream.synchronize().map_err(|e| err("sync", e)).unwrap();
+
+        let got = {
+            let mut v = vec![0.0f32; ROWS * N];
+            d_x.copy_to(&mut v).map_err(|e| err("download", e)).unwrap();
+            v
+        };
+        let mut max_err = 0.0f32;
+        for (g, e) in got.iter().zip(expected.iter()) {
+            max_err = max_err.max((g - e).abs());
+        }
+        // probabilità sommano a 1: tolleranza assoluta stretta ma onesta
+        // su expf di libdevice (~2 ulp)
+        println!("softmax max_err = {max_err:.3e}");
+        assert!(max_err < 1e-5, "parity softmax: max_err={max_err}");
+    }
+
+    #[test]
+    fn silu_mul_parity_contro_cpu() {
+        const N: usize = 1000;
+        let gpu = Gpu::new().unwrap();
+        let func = gpu.function("silu_mul_f32").unwrap();
+
+        // range realistico post-proiezioni FFN
+        let gate: Vec<f32> = lcg_input(N, 0xCAFE).iter().map(|&v| v * 5.0).collect();
+        let up: Vec<f32> = lcg_input(N, 0xF00D).iter().map(|&v| v * 5.0).collect();
+        let expected = silu_mul_cpu(&gate, &up);
+
+        let d_g = DeviceBuffer::from_slice(&gate).unwrap();
+        let d_u = DeviceBuffer::from_slice(&up).unwrap();
+        let d_out = DeviceBuffer::<f32>::zeroed(N).unwrap();
+
+        let threads = 256;
+        let blocks = (N as u32).div_ceil(threads);
+        let stream = &gpu.stream;
+        unsafe {
+            launch!(
+                func<<<blocks, threads, 0, stream>>>(
+                    d_g.as_device_ptr(),
+                    d_u.as_device_ptr(),
+                    d_out.as_device_ptr(),
+                    N as u32
+                )
+            )
+            .map_err(|e| err("launch", e))
+            .unwrap();
+        }
+        gpu.stream.synchronize().map_err(|e| err("sync", e)).unwrap();
+
+        let got = {
+            let mut v = vec![0.0f32; N];
+            d_out.copy_to(&mut v).map_err(|e| err("download", e)).unwrap();
+            v
+        };
+        let mut max_err = 0.0f32;
+        for (g, e) in got.iter().zip(expected.iter()) {
+            max_err = max_err.max((g - e).abs());
+        }
+        println!("silu_mul max_err = {max_err:.3e}");
+        assert!(max_err < 1e-4, "parity silu_mul: max_err={max_err}");
     }
 }
