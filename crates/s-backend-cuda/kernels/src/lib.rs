@@ -204,3 +204,155 @@ pub unsafe fn silu_mul_f32(gate: *const f32, up: *const f32, out: *mut f32, n: u
         *out.add(i as usize) = silu * *up.add(i as usize);
     }
 }
+
+/// Bias broadcast per righe: x[s*n+i] += bias[i]. Un thread per elemento.
+/// has_bias = 0 → nessun bias (modelli senza): il kernel esce subito.
+/// NOTA: flag esplicito invece di puntatore NULL — il launch di cust impone
+/// DeviceCopy sui parametri e i nullable attraverso la macro sono fragili;
+/// il flag è anche più leggibile nel PTX generato.
+#[kernel]
+#[allow(improper_ctypes_definitions)]
+pub unsafe fn add_bias_f32(x: *mut f32, bias: *const f32, seq: u32, n: u32, has_bias: u32) {
+    if has_bias == 0 {
+        return;
+    }
+    let idx = index_1d();
+    if idx >= seq * n {
+        return;
+    }
+    let i = idx % n;
+    *x.add(idx as usize) += *bias.add(i as usize);
+}
+
+/// Embedding lookup: out[s*ne+i] = table[ids[s]*ne+i]. Un thread per elemento.
+#[kernel]
+#[allow(improper_ctypes_definitions)]
+pub unsafe fn gather_rows_f32(
+    table: *const f32,
+    ids: *const u32,
+    out: *mut f32,
+    seq: u32,
+    ne: u32,
+) {
+    let idx = index_1d();
+    if idx >= seq * ne {
+        return;
+    }
+    let s = idx / ne;
+    let i = idx % ne;
+    let tok = *ids.add(s as usize) as usize;
+    *out.add(idx as usize) = *table.add(tok * ne as usize + i as usize);
+}
+
+/// Copia n f32: dst[0..n] = src[0..n]. Serve per l'append K/V nella cache
+/// device a offset arbitrario (dst arriva già offsettato dal launch).
+#[kernel]
+#[allow(improper_ctypes_definitions)]
+pub unsafe fn copy_n_f32(src: *const f32, dst: *mut f32, n: u32) {
+    let i = index_1d();
+    if i < n {
+        *dst.add(i as usize) = *src.add(i as usize);
+    }
+}
+
+/// Punteggi d'attenzione causali: un thread per (s, h).
+///
+/// scores[(s*n_heads+h)*W + t] = dot(q[s,h], k[t,kvh]) * scale per
+/// t <= pos0+s, -INF per t > pos0+s fino a W (= pos0+seq, larghezza
+/// uniforme delle righe). UNA RIGA PER TESTA: le teste NON condividono la
+/// riga s (bug trovato dal parity test — le si sovrascrivevano a vicenda).
+///
+/// Il padding -INF permette di riusare softmax_rows_f32 su righe larghe W:
+/// exp(-INF - max) = 0 esatto, e aggiungere 0.0 non altera la somma bitwise.
+///
+/// L'ordine di accumulo del dot (d sequenziale) è IDENTICO al forward CPU:
+/// è la condizione per la parity stretta.
+#[kernel]
+#[allow(improper_ctypes_definitions)]
+pub unsafe fn attention_scores_f32(
+    q: *const f32,        // [seq × n_heads*hd]
+    k_cache: *const f32,  // [n_layers][max_seq][kv_dim], qui offsettato al layer
+    scores: *mut f32,     // [seq × n_heads × W]
+    seq: u32,
+    pos0: u32,
+    w_width: u32,         // W = pos0 + seq
+    n_heads: u32,
+    n_kv_heads: u32,
+    hd: u32,
+    kv_dim: u32,
+    scale: f32,
+) {
+    let idx = index_1d(); // s * n_heads + h
+    if idx >= seq * n_heads {
+        return;
+    }
+    let s = idx / n_heads;
+    let h = idx % n_heads;
+    let heads_per_kv = n_heads / n_kv_heads;
+    let kvh = h / heads_per_kv;
+
+    let q_row = q.add((s * n_heads * hd) as usize).add((h * hd) as usize);
+    let abs_s = pos0 + s;
+
+    let sc_row = scores.add((idx * w_width) as usize);
+    let mut t = 0u32;
+    while t < w_width {
+        if t <= abs_s {
+            let k_row = k_cache.add((t * kv_dim) as usize).add((kvh * hd) as usize);
+            let mut dot = 0.0f32;
+            let mut d = 0u32;
+            while d < hd {
+                dot += *q_row.add(d as usize) * *k_row.add(d as usize);
+                d += 1;
+            }
+            *sc_row.add(t as usize) = dot * scale;
+        } else {
+            *sc_row.add(t as usize) = f32::NEG_INFINITY;
+        }
+        t += 1;
+    }
+}
+
+/// Somma pesata dei V: un thread per elemento di output (s, h, d).
+///
+/// out[s,h,d] = Σ_t weights[(s*n_heads+h)*W + t] * v_cache[t,kvh,d],
+/// con t <= pos0+s (bound causale esplicito: non ci affidiamo al padding).
+#[kernel]
+#[allow(improper_ctypes_definitions)]
+pub unsafe fn attn_weighted_sum_f32(
+    weights: *const f32,  // [seq × n_heads × W] già softmaxate
+    v_cache: *const f32,  // offsettato al layer
+    out: *mut f32,        // [seq × n_heads*hd]
+    seq: u32,
+    pos0: u32,
+    w_width: u32,
+    n_heads: u32,
+    n_kv_heads: u32,
+    hd: u32,
+    kv_dim: u32,
+) {
+    let idx = index_1d(); // s * n_heads*hd + h*hd + d
+    let total = seq * n_heads * hd;
+    if idx >= total {
+        return;
+    }
+    let s = idx / (n_heads * hd);
+    let rem = idx % (n_heads * hd);
+    let h = rem / hd;
+    let d = rem % hd;
+    let heads_per_kv = n_heads / n_kv_heads;
+    let kvh = h / heads_per_kv;
+
+    let w_row = weights.add(((s * n_heads + h) * w_width) as usize);
+    let o = out.add(idx as usize);
+
+    let abs_s = pos0 + s;
+    let mut acc = 0.0f32;
+    let mut t = 0u32;
+    while t <= abs_s {
+        let v = v_cache.add((t * kv_dim) as usize).add((kvh * hd) as usize).add(d as usize);
+        acc += *w_row.add(t as usize) * *v;
+        t += 1;
+    }
+    *o = acc;
+}

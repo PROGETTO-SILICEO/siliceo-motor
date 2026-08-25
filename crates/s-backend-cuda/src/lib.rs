@@ -13,6 +13,8 @@
 //! entra nel repo solo con un test di parity contro il riferimento CPU.
 
 #[cfg(feature = "cuda")]
+pub mod model;
+#[cfg(feature = "cuda")]
 pub mod runtime;
 
 /// true se questo binario è stato compilato col backend CUDA.

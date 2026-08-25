@@ -19,7 +19,7 @@ use cust::CudaFlags;
 
 pub type DevResult = Result<(), String>;
 
-fn err<E: std::fmt::Display>(what: &str, e: E) -> String {
+pub(crate) fn err<E: std::fmt::Display>(what: &str, e: E) -> String {
     format!("cuda/{what}: {e}")
 }
 

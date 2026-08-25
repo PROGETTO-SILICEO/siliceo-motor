@@ -413,19 +413,42 @@ impl Model {
         // ── finale ──
         let mut last = vec![0.0f32; ne];
         last.copy_from_slice(&x[(seq - 1) * ne..seq * ne]);
-        let last = rmsnorm_row(&last, &self.output_norm, c.rms_eps);
+        self.logits_from_last_hidden(&last)
+    }
+
+    /// Ultimo stadio del forward, condiviso da CPU e GPU (F3b step 4):
+    /// norm finale + proiezione output head → logits [vocab_size].
+    ///
+    /// Free function PUBBLICA perché il backend GPU la chiama con le proprie
+    /// copie host di output_norm/output: UNA sola implementazione, zero
+    /// rischio di divergenza tra i path.
+    pub fn logits_from_hidden(
+        output_norm: &[f32],
+        output: &[f32],
+        n_embd: usize,
+        rms_eps: f32,
+        last_hidden: &[f32],
+    ) -> Vec<f32> {
+        let ne = n_embd;
+        let last = rmsnorm_row(last_hidden, output_norm, rms_eps);
 
         // logits = last @ output^T
-        let mut logits = vec![0.0f32; c.vocab_size];
-        for o in 0..c.vocab_size {
+        let mut logits = vec![0.0f32; output.len() / ne];
+        for o in 0..logits.len() {
             let w_off = o * ne;
             let mut sum = 0.0f32;
             for d in 0..ne {
-                sum += self.output[w_off + d] * last[d];
+                sum += output[w_off + d] * last[d];
             }
             logits[o] = sum;
         }
         logits
+    }
+
+    /// Variante comoda sul modello (usata dai forward CPU).
+    pub fn logits_from_last_hidden(&self, last_hidden: &[f32]) -> Vec<f32> {
+        let c = &self.config;
+        Self::logits_from_hidden(&self.output_norm, &self.output, c.n_embd, c.rms_eps, last_hidden)
     }
     /// Forward con KV cache incrementale — F2.5.
     ///
@@ -531,29 +554,75 @@ impl Model {
 
         cache.advance(seq);
 
-        // final norm + logits sull'ULTIMO token
+        // final norm + logits sull'ULTIMO token (stesso codice del full-recompute)
         let mut last = vec![0.0f32; ne];
         last.copy_from_slice(&x[(seq - 1) * ne..seq * ne]);
-        let last = rmsnorm_row(&last, &self.output_norm, c.rms_eps);
-
-        let mut logits = vec![0.0f32; c.vocab_size];
-        for o in 0..c.vocab_size {
-            let w_off = o * ne;
-            let mut sum = 0.0f32;
-            for d in 0..ne {
-                sum += self.output[w_off + d] * last[d];
-            }
-            logits[o] = sum;
-        }
-        logits
+        self.logits_from_last_hidden(&last)
     }
 
 }
 
+// ── vista di lettura dei pesi (per i backend residenti su device) ──
+
+/// Vista read-only sui pesi di un layer, per l'upload una tantum su GPU
+/// (F3b step 4). Nessuna copia: slice dirette sui buffer del Model.
+pub struct LayerWeightView<'a> {
+    pub attn_norm: &'a [f32],
+    pub wq: &'a [f32],
+    pub bq: Option<&'a [f32]>,
+    pub wk: &'a [f32],
+    pub bk: Option<&'a [f32]>,
+    pub wv: &'a [f32],
+    pub bv: Option<&'a [f32]>,
+    pub wo: &'a [f32],
+    pub ffn_norm: &'a [f32],
+    pub w_gate: &'a [f32],
+    pub w_up: &'a [f32],
+    pub w_down: &'a [f32],
+}
+
+/// Vista read-only su TUTTI i pesi del modello.
+pub struct WeightViews<'a> {
+    pub tok_embd: &'a [f32],
+    /// output head (può condividere il buffer di tok_embd se tied)
+    pub output: &'a [f32],
+    pub output_norm: &'a [f32],
+    pub layers: Vec<LayerWeightView<'a>>,
+}
+
+impl Model {
+    /// Viste sui pesi per i backend che li risiedono su device.
+    /// Le slice restano valide finché vive il Model (borrow).
+    pub fn weight_views(&self) -> WeightViews<'_> {
+        WeightViews {
+            tok_embd: &self.tok_embd,
+            output: &self.output,
+            output_norm: &self.output_norm,
+            layers: self
+                .layers
+                .iter()
+                .map(|l| LayerWeightView {
+                    attn_norm: &l.attn_norm,
+                    wq: &l.wq,
+                    bq: l.bq.as_deref(),
+                    wk: &l.wk,
+                    bk: l.bk.as_deref(),
+                    wv: &l.wv,
+                    bv: l.bv.as_deref(),
+                    wo: &l.wo,
+                    ffn_norm: &l.ffn_norm,
+                    w_gate: &l.w_gate,
+                    w_up: &l.w_up,
+                    w_down: &l.w_down,
+                })
+                .collect(),
+        }
+    }
+}
+
 // ── backend CPU: implementazione del trait Device ──
 
-impl Device for Model {
-    type Cache = SeqState;
+impl Device for Model {    type Cache = SeqState;
 
     fn config(&self) -> &Config {
         &self.config

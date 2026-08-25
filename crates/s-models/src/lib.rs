@@ -13,7 +13,7 @@ pub mod state;
 
 pub use chat::ChatTemplate;
 pub use device::Device;
-pub use qwen2::{Config, Model};
+pub use qwen2::{Config, Model, WeightViews};
 pub use registry::Famiglia;
 pub use sampling::Sampler;
 pub use state::SeqState;
