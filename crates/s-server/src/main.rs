@@ -27,13 +27,41 @@ use std::fmt::Write as _;
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, RwLock};
 
-struct App {
+/// Tutto ciò che riguarda il modello CARICATO. Sostituibile a caldo:
+/// ogni richiesta prende uno snapshot (`Arc<Inner>`) e lavora su quello,
+/// quindi una richiesta in corso finisce col modello su cui è iniziata.
+struct Inner {
     model: Model,
     tok: Tokenizer,
     im_end_id: Option<u32>,
     model_name: String,
-    /// Default di generazione correnti (risolti: temperatura/max_tokens sempre presenti).
-    /// Mutabili a runtime via POST /v1/config.
+}
+
+impl Inner {
+    /// Carica un GGUF dal disco. Lento (~secondi): va chiamato FUORI dal
+    /// lock di scrittura, così il server continua a servire col vecchio modello.
+    fn load(model_path: &str) -> Result<Arc<Self>, String> {
+        let t0 = std::time::Instant::now();
+        let tok =
+            Tokenizer::from_gguf(model_path).map_err(|e| format!("tokenizer: {e}"))?;
+        let model = Model::load(model_path).map_err(|e| format!("modello: {e}"))?;
+        let im_end_id = tok.token_to_id("<|im_end|>");
+        let model_name = std::path::Path::new(model_path)
+            .file_name()
+            .map(|s| s.to_string_lossy().into_owned())
+            .unwrap_or_else(|| model_path.to_string());
+        eprintln!(
+            "s-server: {model_name} pronto in {:.1}s",
+            t0.elapsed().as_secs_f32()
+        );
+        Ok(Arc::new(Self { model, tok, im_end_id, model_name }))
+    }
+}
+
+struct App {
+    /// Il modello corrente, sostituibile atomicamente (POST /v1/model).
+    inner: RwLock<Arc<Inner>>,
+    /// Default di generazione correnti (risolti). Mutabili via POST /v1/config.
     gen_defaults: RwLock<GenerateDefaults>,
     /// Cosa riportare in GET /v1/config sulla sezione server.
     server_report: (String, u16),
@@ -99,21 +127,15 @@ fn main() {
     let gen0 = GenerateDefaults::default().merge(&file_cfg.generate);
 
     eprintln!("s-server: carico {model_path} ...");
-    let t0 = std::time::Instant::now();
-    let tok = Tokenizer::from_gguf(&model_path).expect("tokenizer");
-    let model = Model::load(&model_path).expect("modello");
+    let inner = Inner::load(&model_path).unwrap_or_else(|e| {
+        eprintln!("s-server: ERRORE nel caricamento: {e}");
+        std::process::exit(1);
+    });
     let app = Arc::new(App {
-        im_end_id: tok.token_to_id("<|im_end|>"),
-        model_name: std::path::Path::new(&model_path)
-            .file_name()
-            .map(|s| s.to_string_lossy().into_owned())
-            .unwrap_or_else(|| model_path.clone()),
-        tok,
-        model,
+        inner: RwLock::new(inner),
         gen_defaults: RwLock::new(gen0),
         server_report: (host.clone(), port),
     });
-    eprintln!("s-server: modello pronto in {:.1}s", t0.elapsed().as_secs_f32());
 
     let addr = format!("{host}:{port}");
     let listener = TcpListener::bind(&addr).expect("bind");
@@ -139,20 +161,25 @@ fn handle(app: &App, stream: &mut TcpStream) {
         }
     };
 
+    // snapshot del modello corrente: le richieste in corso non vedono gli swap
+    let inner = Arc::clone(&app.inner.read().unwrap());
+
     // path senza query string
     let path = req.path.split('?').next().unwrap_or("").to_string();
 
     match (req.method.as_str(), path.as_str()) {
         ("GET", "/health") => {
             let mut buf = String::from("{\"status\":\"ok\",\"model\":");
-            write_escaped(&mut buf, &app.model_name);
-            buf.push('}');
+            write_escaped(&mut buf, &inner.model_name);
+            let _ = write!(buf, ",\"layers\":{},\"embd\":{}}}",
+                inner.model.config.n_layers, inner.model.config.n_embd);
             respond(stream, 200, &buf);
         }
         ("GET", "/v1/config") => get_config(app, stream),
         ("POST", "/v1/config") => patch_config(app, stream, &req.body),
-        ("POST", "/v1/chat/completions") => chat_completions(app, stream, &req.body),
-        ("POST", "/v1/completions") => completions(app, stream, &req.body),
+        ("POST", "/v1/model") => load_model(app, stream, &req.body),
+        ("POST", "/v1/chat/completions") => chat_completions(&inner, app, stream, &req.body),
+        ("POST", "/v1/completions") => completions(&inner, app, stream, &req.body),
         _ => error(stream, 404, format!("endpoint sconosciuto: {} {}", req.method, req.path)),
     }
 }
@@ -210,9 +237,41 @@ fn patch_config(app: &App, stream: &mut TcpStream, body: &[u8]) {
     get_config(app, stream);
 }
 
+/// Hot-swap del modello (D6c): `{"path":"altro.gguf"}`.
+/// Il caricamento avviene FUORI dal lock: finché non riesce, il server
+/// continua a servire col modello vecchio. Se fallisce → errore pulito,
+/// nessun stato toccato.
+fn load_model(app: &App, stream: &mut TcpStream, body: &[u8]) {
+    let j = match parse_body(body) {
+        Ok(j) => j,
+        Err(e) => return error(stream, 400, e),
+    };
+    let nuovo_path = match j.get("path").and_then(|p| p.as_str()) {
+        Some(p) if !p.is_empty() => p.to_string(),
+        _ => return error(stream, 400, "campo 'path' mancante o vuoto"),
+    };
+    if !std::path::Path::new(&nuovo_path).exists() {
+        return error(stream, 400, format!("file non trovato: {nuovo_path}"));
+    }
+
+    eprintln!("s-server: hot-swap verso {nuovo_path} ...");
+    let nuovo = match Inner::load(&nuovo_path) {
+        Ok(n) => n,
+        Err(e) => return error(stream, 400, format!("caricamento fallito ({e}): il modello precedente resta attivo")),
+    };
+
+    let nome = nuovo.model_name.clone();
+    *app.inner.write().unwrap() = nuovo;
+
+    let mut buf = String::from("{\"status\":\"ok\",\"model\":");
+    write_escaped(&mut buf, &nome);
+    buf.push('}');
+    respond(stream, 200, &buf);
+}
+
 // ── endpoint ──
 
-fn completions(app: &App, stream: &mut TcpStream, body: &[u8]) {
+fn completions(inner: &Inner, app: &App, stream: &mut TcpStream, body: &[u8]) {
     let j = match parse_body(body) {
         Ok(j) => j,
         Err(e) => return error(stream, 400, e),
@@ -226,16 +285,16 @@ fn completions(app: &App, stream: &mut TcpStream, body: &[u8]) {
         Err(e) => return error(stream, 400, e),
     };
 
-    let ids = match app.tok.encode(&prompt) {
+    let ids = match inner.tok.encode(&prompt) {
         Ok(i) => i,
         Err(e) => return error(stream, 400, e.to_string()),
     };
 
-    let out = run_generate(app, &ids, &params);
+    let out = run_generate(inner, &ids, &params);
     respond_json_completion(stream, out.finish_reason, &out.text, ids.len(), &out);
 }
 
-fn chat_completions(app: &App, stream: &mut TcpStream, body: &[u8]) {
+fn chat_completions(inner: &Inner, app: &App, stream: &mut TcpStream, body: &[u8]) {
     let j = match parse_body(body) {
         Ok(j) => j,
         Err(e) => return error(stream, 400, e),
@@ -254,28 +313,28 @@ fn chat_completions(app: &App, stream: &mut TcpStream, body: &[u8]) {
     };
     // EOS di chat: <|im_end|> chiude il turno dell'assistente
     let mut params = params;
-    if let Some(id) = app.im_end_id {
+    if let Some(id) = inner.im_end_id {
         params.extra_eos.push(id);
     }
 
-    let ids = match app.tok.encode(&prompt) {
+    let ids = match inner.tok.encode(&prompt) {
         Ok(i) => i,
         Err(e) => return error(stream, 400, e.to_string()),
     };
 
-    let out = run_generate(app, &ids, &params);
+    let out = run_generate(inner, &ids, &params);
     respond_json_chat(stream, out.finish_reason, &out.text, ids.len(), &out);
 }
 
 // ── motore ──
 
 /// Esegue la generazione (bloccante) e ritorna il risultato.
-fn run_generate<'a>(
-    app: &'a App,
+fn run_generate(
+    inner: &Inner,
     ids: &[u32],
     params: &GenerateParams,
 ) -> s_models::generate::Generated {
-    generate(&app.model, &app.tok, ids, params)
+    generate(&inner.model, &inner.tok, ids, params)
 }
 
 // ── helpers ──

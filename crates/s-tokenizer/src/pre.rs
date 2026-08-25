@@ -24,11 +24,12 @@ pub struct PreTokenizer {
 
 impl PreTokenizer {
     /// Regex per la famiglia indicata dal KV tokenizer.ggml.pre.
-    /// 'qwen2', 'gpt2', 'llama3' e default cadono qui (llama3 ha regex propria,
-    /// per ora approssimata con questa — la parity lo dirà).
+    /// 'qwen2', 'gpt2', 'smollm' e default cadono qui ('smollm' usa la regex
+    /// GPT-2 nel suo tokenizer.json; 'llama3' ha regex propria, per ora
+    /// approssimata con questa — la parity lo dirà).
     pub fn for_kind(kind: &str) -> std::result::Result<Self, TokenizerError> {
         let pattern = match kind {
-            "qwen2" | "gpt2" | "default" => {
+            "qwen2" | "gpt2" | "smollm" | "default" => {
                 r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
             }
             other => return Err(TokenizerError::UnknownPre(other.to_string())),

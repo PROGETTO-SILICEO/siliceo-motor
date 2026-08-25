@@ -75,11 +75,11 @@ pub struct Model {
 struct LayerWeights {
     attn_norm: Vec<f32>,
     wq: Vec<f32>,
-    bq: Vec<f32>,
+    bq: Option<Vec<f32>>,
     wk: Vec<f32>,
-    bk: Vec<f32>,
+    bk: Option<Vec<f32>>,
     wv: Vec<f32>,
-    bv: Vec<f32>,
+    bv: Option<Vec<f32>>,
     wo: Vec<f32>,
     ffn_norm: Vec<f32>,
     w_gate: Vec<f32>,
@@ -115,15 +115,19 @@ impl Model {
         };
         let mut layers = Vec::with_capacity(config.n_layers);
         for i in 0..config.n_layers {
+            // bias prima della closure: evita il doppio borrow mutabile di gguf
+            let bq = opt_bias(&mut gguf, i, "attn_q.bias")?;
+            let bk = opt_bias(&mut gguf, i, "attn_k.bias")?;
+            let bv = opt_bias(&mut gguf, i, "attn_v.bias")?;
             let mut l = |n: &str| -> Result<Vec<f32>, String> { dequant_tensor(&mut gguf, &format!("blk.{i}.{n}")) };
             layers.push(LayerWeights {
                 attn_norm: l("attn_norm.weight")?,
                 wq: l("attn_q.weight")?,
-                bq: l("attn_q.bias")?,
+                bq,
                 wk: l("attn_k.weight")?,
-                bk: l("attn_k.bias")?,
+                bk,
                 wv: l("attn_v.weight")?,
-                bv: l("attn_v.bias")?,
+                bv,
                 wo: l("attn_output.weight")?,
                 ffn_norm: l("ffn_norm.weight")?,
                 w_gate: l("ffn_gate.weight")?,
@@ -182,11 +186,14 @@ impl Model {
         {
             let l = &self.layers[0];
             for (name, w) in [
-                ("attn_norm", &l.attn_norm), ("wq", &l.wq), ("bq", &l.bq),
+                ("attn_norm", &l.attn_norm), ("wq", &l.wq),
                 ("wv", &l.wv), ("wo", &l.wo), ("w_gate", &l.w_gate),
                 ("w_up", &l.w_up), ("w_down", &l.w_down),
             ] {
                 stats(&format!("pesi blk0.{name}"), w);
+            }
+            if let Some(bq) = &l.bq {
+                stats("pesi blk0.bq", bq);
             }
         }
 
@@ -205,9 +212,9 @@ impl Model {
             matmul_rows(&layer.wq, ne, ne, &normed, seq, &mut q);
             matmul_rows(&layer.wk, kv_dim, ne, &normed, seq, &mut k);
             matmul_rows(&layer.wv, kv_dim, ne, &normed, seq, &mut v);
-            add_bias_rows(&mut q, &layer.bq, seq, ne);
-            add_bias_rows(&mut k, &layer.bk, seq, kv_dim);
-            add_bias_rows(&mut v, &layer.bv, seq, kv_dim);
+            add_bias_rows(&mut q, layer.bq.as_deref(), seq, ne);
+            add_bias_rows(&mut k, layer.bk.as_deref(), seq, kv_dim);
+            add_bias_rows(&mut v, layer.bv.as_deref(), seq, kv_dim);
             if li == 0 {
                 eprintln!("L0 attn_norm[0..4]={:?} len={}", &layer.attn_norm[0..4], layer.attn_norm.len());
                 stats("L0 normed", &normed);
@@ -328,9 +335,9 @@ impl Model {
             matmul_rows(&layer.wq, ne, ne, &normed, seq, &mut q);
             matmul_rows(&layer.wk, kv_dim, ne, &normed, seq, &mut k);
             matmul_rows(&layer.wv, kv_dim, ne, &normed, seq, &mut v);
-            add_bias_rows(&mut q, &layer.bq, seq, ne);
-            add_bias_rows(&mut k, &layer.bk, seq, kv_dim);
-            add_bias_rows(&mut v, &layer.bv, seq, kv_dim);
+            add_bias_rows(&mut q, layer.bq.as_deref(), seq, ne);
+            add_bias_rows(&mut k, layer.bk.as_deref(), seq, kv_dim);
+            add_bias_rows(&mut v, layer.bv.as_deref(), seq, kv_dim);
 
             // RoPE (NORM: coppie interleaved) su q e k
             rope_norm(&mut q, seq, c.n_heads, hd, c.rope_theta);
@@ -448,9 +455,9 @@ impl Model {
             matmul_rows(&layer.wq, ne, ne, &normed, seq, &mut q);
             matmul_rows(&layer.wk, kv_dim, ne, &normed, seq, &mut k_new);
             matmul_rows(&layer.wv, kv_dim, ne, &normed, seq, &mut v_new);
-            add_bias_rows(&mut q, &layer.bq, seq, ne);
-            add_bias_rows(&mut k_new, &layer.bk, seq, kv_dim);
-            add_bias_rows(&mut v_new, &layer.bv, seq, kv_dim);
+            add_bias_rows(&mut q, layer.bq.as_deref(), seq, ne);
+            add_bias_rows(&mut k_new, layer.bk.as_deref(), seq, kv_dim);
+            add_bias_rows(&mut v_new, layer.bv.as_deref(), seq, kv_dim);
 
             // RoPE con posizione ASSOLUTA (i token nuovi continuano la sequenza)
             rope_norm_offset(&mut q, seq, c.n_heads, hd, c.rope_theta, pos0);
@@ -567,12 +574,27 @@ fn matmul_rows(w: &[f32], n_out: usize, n_in: usize, x: &[f32], seq: usize, y: &
     }
 }
 
-fn add_bias_rows(y: &mut [f32], b: &[f32], seq: usize, n: usize) {
+fn add_bias_rows(y: &mut [f32], b: Option<&[f32]>, seq: usize, n: usize) {
+    let Some(b) = b else { return }; // famiglia llama: nessun bias
     for s in 0..seq {
         for i in 0..n {
             y[s * n + i] += b[i];
         }
     }
+}
+
+/// Bias QKV: presente in qwen2, assente nella famiglia llama. Se il tensore
+/// manca → None (il forward salta l'addizione).
+fn opt_bias(
+    gguf: &mut GgufFile,
+    layer: usize,
+    name: &str,
+) -> Result<Option<Vec<f32>>, String> {
+    let full = format!("blk.{layer}.{name}");
+    if gguf.tensor(&full).is_err() {
+        return Ok(None);
+    }
+    dequant_tensor(gguf, &full).map(Some)
 }
 
 /// RoPE stile NEOX (half-split): coppia (i, i+hd/2) ruotata di angle = pos * theta^(-2i/d).
