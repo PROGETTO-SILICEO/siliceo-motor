@@ -7,6 +7,8 @@
 //!
 //! Verifica F1: generazione greedy token-identica a llama.cpp.
 
+use crate::device::Device;
+use crate::kv::KvCache;
 use s_gguf::GgufFile;
 
 #[derive(Debug, Clone)]
@@ -540,6 +542,24 @@ impl Model {
         logits
     }
 
+}
+
+// ── backend CPU: implementazione del trait Device ──
+
+impl Device for Model {
+    type Cache = KvCache;
+
+    fn config(&self) -> &Config {
+        &self.config
+    }
+
+    fn new_cache(&self, max_seq: usize) -> KvCache {
+        KvCache::new(&self.config, max_seq)
+    }
+
+    fn forward_cached(&self, tokens: &[u32], cache: &mut KvCache) -> Vec<f32> {
+        self.forward_cached(tokens, cache)
+    }
 }
 
 // ── primitive ──

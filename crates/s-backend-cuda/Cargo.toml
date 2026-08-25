@@ -6,3 +6,11 @@ license.workspace = true
 authors.workspace = true
 
 [dependencies]
+s-models = { path = "../s-models" }
+# Dipendenza CUDA SOLO dietro feature: il workspace compila ovunque senza
+# driver/toolkit NVIDIA (CI, macchine CPU, repo pubblica). cust richiede
+# libcuda a link-time → mai dipendenza di default finché non serve.
+cust = { version = "0.3", optional = true }
+
+[features]
+cuda = ["dep:cust"]

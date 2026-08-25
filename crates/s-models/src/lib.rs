@@ -4,11 +4,13 @@
 //! QKV). Obiettivo: PARITY dei logits con llama.cpp sullo stesso prompt.
 
 pub mod chat;
+pub mod device;
 pub mod generate;
 pub mod kv;
 pub mod qwen2;
 pub mod sampling;
 
 pub use chat::ChatTemplate;
+pub use device::Device;
 pub use qwen2::{Config, Model};
 pub use sampling::Sampler;
