@@ -49,6 +49,10 @@ pub struct Tokenizer {
     bos_id: Option<u32>,
     eos_id: Option<u32>,
     add_bos: bool,
+    /// Token speciali del vocabolario ("<|...|>"), ordinati per lunghezza
+    /// decrescente. Riconosciuti PRIMA della pre-tokenizzazione: la regex
+    /// li spezzerebbe in pezzi non ricomponibili (bug D6d, visto su SmolLM).
+    specials: Vec<String>,
 }
 
 impl Tokenizer {
@@ -117,6 +121,14 @@ impl Tokenizer {
             .unwrap_or("qwen2")
             .to_string();
 
+        let mut specials: Vec<String> = tokens
+            .iter()
+            .filter(|t| t.starts_with("<|") && t.ends_with("|>"))
+            .cloned()
+            .collect();
+        // longest-match: "<|im_start|>" deve battere eventuali prefissi
+        specials.sort_by_key(|t| std::cmp::Reverse(t.len()));
+
         Ok(Self {
             vocab: tokens,
             token_to_id,
@@ -127,10 +139,11 @@ impl Tokenizer {
             bos_id,
             eos_id,
             add_bos,
+            specials,
         })
     }
 
-    /// Codifica testo → token IDs (senza BOS; usa `encode_with_specials` per il comportamento completo).
+    /// Codifica testo → token IDs (senza BOS).
     pub fn encode(&self, text: &str) -> Result<Vec<u32>> {
         let mut ids = Vec::new();
         if self.add_bos {
@@ -138,10 +151,42 @@ impl Tokenizer {
                 ids.push(b);
             }
         }
-        for piece in self.pre.split(text) {
-            ids.extend(self.encode_piece(&piece)?);
-        }
+        self.encode_inner(text, &mut ids)?;
         Ok(ids)
+    }
+
+    /// Segmentazione: i token speciali vengono riconosciuti come unità
+    /// intere (longest match), il resto passa alla regex + BPE.
+    fn encode_inner(&self, text: &str, ids: &mut Vec<u32>) -> Result<()> {
+        let mut normale = String::new();
+        let mut i = 0usize;
+        while i < text.len() {
+            if text.is_char_boundary(i) {
+                let rest = &text[i..];
+                if let Some(sp) = self.specials.iter().find(|s| rest.starts_with(s.as_str())) {
+                    if !normale.is_empty() {
+                        for piece in self.pre.split(&normale) {
+                            ids.extend(self.encode_piece(&piece)?);
+                        }
+                        normale.clear();
+                    }
+                    ids.push(self.token_to_id[sp.as_str()]);
+                    i += sp.len();
+                    continue;
+                }
+            }
+            // avanza di un carattere UTF-8
+            let step = utf8_step(text[i..].as_bytes()[0]);
+            let end = (i + step).min(text.len());
+            normale.push_str(&text[i..end]);
+            i = end;
+        }
+        if !normale.is_empty() {
+            for piece in self.pre.split(&normale) {
+                ids.extend(self.encode_piece(&piece)?);
+            }
+        }
+        Ok(())
     }
 
     /// Codifica un singolo pre-token (già segmentato dalla regex).
@@ -230,6 +275,10 @@ impl Tokenizer {
     pub fn token_to_id(&self, tok: &str) -> Option<u32> {
         self.token_to_id.get(tok).copied()
     }
+    /// Token speciali riconosciuti (ordinati per lunghezza decrescente).
+    pub fn specials(&self) -> &[String] {
+        &self.specials
+    }
 }
 
 fn gguf_array_str(gguf: &s_gguf::GgufFile, key: &str) -> Result<Vec<String>> {
@@ -251,4 +300,9 @@ fn gguf_array_str(gguf: &s_gguf::GgufFile, key: &str) -> Result<Vec<String>> {
         }
         _ => Err(TokenizerError::BadKvType(key.to_string())),
     }
+}
+
+/// Lunghezza in byte del carattere UTF-8 che inizia con questo byte.
+fn utf8_step(b: u8) -> usize {
+    if b < 0x80 { 1 } else if b < 0xE0 { 2 } else if b < 0xF0 { 3 } else { 4 }
 }

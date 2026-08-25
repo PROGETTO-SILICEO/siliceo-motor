@@ -20,6 +20,8 @@ mod http;
 
 use s_config::json::{parse, write_escaped, Json};
 use s_config::{FileConfig, GenerateDefaults};
+use s_gguf::GgufFile;
+use s_models::chat::ChatTemplate;
 use s_models::generate::{generate, GenerateParams};
 use s_models::Model;
 use s_tokenizer::Tokenizer;
@@ -33,19 +35,37 @@ use std::sync::{Arc, RwLock};
 struct Inner {
     model: Model,
     tok: Tokenizer,
-    im_end_id: Option<u32>,
     model_name: String,
+    /// Template di chat del modello (D6d): rilevato dal GGUF o dalla config.
+    chat: ChatTemplate,
 }
 
 impl Inner {
     /// Carica un GGUF dal disco. Lento (~secondi): va chiamato FUORI dal
     /// lock di scrittura, così il server continua a servire col vecchio modello.
-    fn load(model_path: &str) -> Result<Arc<Self>, String> {
+    fn load(model_path: &str, template_over: Option<&str>) -> Result<Arc<Self>, String> {
         let t0 = std::time::Instant::now();
         let tok =
             Tokenizer::from_gguf(model_path).map_err(|e| format!("tokenizer: {e}"))?;
         let model = Model::load(model_path).map_err(|e| format!("modello: {e}"))?;
-        let im_end_id = tok.token_to_id("<|im_end|>");
+
+        // metadata per il template di chat (riapertura leggera, solo KV)
+        let gguf = GgufFile::open(model_path).map_err(|e| e.to_string())?;
+        let kv_str = |key: &str| {
+            gguf.metadata.iter().find(|(k, _)| k == key).and_then(|(_, v)| v.as_str())
+        };
+        let arch = kv_str("general.architecture").unwrap_or("sconosciuta").to_string();
+        let chat = ChatTemplate::detect(
+            &arch,
+            kv_str("tokenizer.chat_template"),
+            template_over,
+        )?;
+        eprintln!(
+            "load: arch={arch}, template={} ({})",
+            chat.format.name(),
+            chat.source
+        );
+
         let model_name = std::path::Path::new(model_path)
             .file_name()
             .map(|s| s.to_string_lossy().into_owned())
@@ -54,7 +74,7 @@ impl Inner {
             "s-server: {model_name} pronto in {:.1}s",
             t0.elapsed().as_secs_f32()
         );
-        Ok(Arc::new(Self { model, tok, im_end_id, model_name }))
+        Ok(Arc::new(Self { model, tok, model_name, chat }))
     }
 }
 
@@ -65,6 +85,9 @@ struct App {
     gen_defaults: RwLock<GenerateDefaults>,
     /// Cosa riportare in GET /v1/config sulla sezione server.
     server_report: (String, u16),
+    /// Override template di chat da config/CLI (None = auto), valido
+    /// anche per i modelli caricati a caldo.
+    template_over: Option<String>,
 }
 
 fn main() {
@@ -127,7 +150,7 @@ fn main() {
     let gen0 = GenerateDefaults::default().merge(&file_cfg.generate);
 
     eprintln!("s-server: carico {model_path} ...");
-    let inner = Inner::load(&model_path).unwrap_or_else(|e| {
+    let inner = Inner::load(&model_path, file_cfg.model_template.as_deref()).unwrap_or_else(|e| {
         eprintln!("s-server: ERRORE nel caricamento: {e}");
         std::process::exit(1);
     });
@@ -135,6 +158,7 @@ fn main() {
         inner: RwLock::new(inner),
         gen_defaults: RwLock::new(gen0),
         server_report: (host.clone(), port),
+        template_over: file_cfg.model_template.clone(),
     });
 
     let addr = format!("{host}:{port}");
@@ -171,8 +195,9 @@ fn handle(app: &App, stream: &mut TcpStream) {
         ("GET", "/health") => {
             let mut buf = String::from("{\"status\":\"ok\",\"model\":");
             write_escaped(&mut buf, &inner.model_name);
-            let _ = write!(buf, ",\"layers\":{},\"embd\":{}}}",
-                inner.model.config.n_layers, inner.model.config.n_embd);
+            let _ = write!(buf, ",\"layers\":{},\"embd\":{},\"chat\":\"{}\",\"tpl_from\":\"{}\"}}",
+                inner.model.config.n_layers, inner.model.config.n_embd,
+                inner.chat.format.name(), inner.chat.source);
             respond(stream, 200, &buf);
         }
         ("GET", "/v1/config") => get_config(app, stream),
@@ -255,7 +280,7 @@ fn load_model(app: &App, stream: &mut TcpStream, body: &[u8]) {
     }
 
     eprintln!("s-server: hot-swap verso {nuovo_path} ...");
-    let nuovo = match Inner::load(&nuovo_path) {
+    let nuovo = match Inner::load(&nuovo_path, app.template_over.as_deref()) {
         Ok(n) => n,
         Err(e) => return error(stream, 400, format!("caricamento fallito ({e}): il modello precedente resta attivo")),
     };
@@ -303,18 +328,28 @@ fn chat_completions(inner: &Inner, app: &App, stream: &mut TcpStream, body: &[u8
         Some(m) if !m.is_empty() => m,
         _ => return error(stream, 400, "campo 'messages' mancante o vuoto"),
     };
-    let prompt = match render_chatml(messages) {
-        Ok(p) => p,
-        Err(e) => return error(stream, 400, e),
-    };
+    // prompt dal template DEL MODELLO (D6d) + EOS di chat del formato
+    let mut coppie: Vec<(&str, &str)> = Vec::with_capacity(messages.len());
+    for m in messages {
+        let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
+        let content = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
+        if role.is_empty() || content.is_empty() {
+            return error(stream, 400, "message senza 'role' o 'content' stringa");
+        }
+        coppie.push((role, content));
+    }
+    let prompt = inner.chat.render(&coppie);
+
     let params = match params_from_json(app, &j) {
         Ok(p) => p,
         Err(e) => return error(stream, 400, e),
     };
-    // EOS di chat: <|im_end|> chiude il turno dell'assistente
+    // EOS di chat: i token di chiusura turno del formato attivo
     let mut params = params;
-    if let Some(id) = inner.im_end_id {
-        params.extra_eos.push(id);
+    for stop in inner.chat.format.stop_tokens() {
+        if let Some(id) = inner.tok.token_to_id(stop) {
+            params.extra_eos.push(id);
+        }
     }
 
     let ids = match inner.tok.encode(&prompt) {
@@ -383,23 +418,6 @@ fn params_from_json(app: &App, j: &Json) -> Result<GenerateParams, String> {
         }
     }
     Ok(p)
-}
-
-/// Template ChatML (Qwen2.5):
-/// <|im_start|>{role}\n{content}<|im_end|>\n ... <|im_start|>assistant\n
-fn render_chatml(messages: &[Json]) -> Result<String, String> {
-    let mut prompt = String::new();
-    for m in messages {
-        let role = m.get("role").and_then(|r| r.as_str()).ok_or("message senza 'role'")?;
-        let content = m.get("content").and_then(|c| c.as_str()).ok_or("message senza 'content'")?;
-        prompt.push_str("<|im_start|>");
-        prompt.push_str(role);
-        prompt.push('\n');
-        prompt.push_str(content);
-        prompt.push_str("<|im_end|>\n");
-    }
-    prompt.push_str("<|im_start|>assistant\n");
-    Ok(prompt)
 }
 
 fn respond(stream: &mut TcpStream, status: u16, body: &str) {

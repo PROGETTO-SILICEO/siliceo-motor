@@ -87,6 +87,8 @@ pub struct FileConfig {
     pub generate: GenerateDefaults,
     /// Path del modello; sovrascrive quello posizionale se presente.
     pub model_path: Option<String>,
+    /// Template di chat: "auto" | "chatml" | "llama3". None = auto.
+    pub model_template: Option<String>,
 }
 
 impl FileConfig {
@@ -123,8 +125,10 @@ impl Json {
 
         if let Some(m) = j.get("model") {
             c.model_path = m.get("path").and_then(|v| v.as_str()).map(String::from);
+            c.model_template =
+                m.get("template").and_then(|v| v.as_str()).map(String::from);
             // chiavi non riconosciute nella sezione model sono tollerate
-            // (context/template arrivano in D6c/D6d) — nessun errore.
+            // (context arriva in D6c) — nessun errore.
         }
 
         if let Some(g) = j.get("generate") {

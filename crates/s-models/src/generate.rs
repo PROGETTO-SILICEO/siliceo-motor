@@ -94,6 +94,9 @@ pub fn generate(
     let mut generated: Vec<u32> = Vec::with_capacity(params.max_tokens);
     let mut stopped_text: Option<String> = None;
     let mut next_logits;
+    // OpenAI semantics: "stop" se fermati da EOS o stop-string, "length" solo
+    // se esauriti i token senza fermata naturale.
+    let mut motivo = "length";
 
     // ── prefill: tutto il prompt in un colpo ──
     next_logits = model.forward_cached(prompt_ids, &mut cache);
@@ -109,6 +112,7 @@ pub fn generate(
         last_token = next;
 
         if eos_all.contains(&next) {
+            motivo = "stop";
             break;
         }
 
@@ -118,12 +122,13 @@ pub fn generate(
             if let Some(hit) = params.stop.iter().find(|s| !s.is_empty() && full.contains(s.as_str())) {
                 let pos = full.find(hit.as_str()).unwrap_or(full.len());
                 stopped_text = Some(full[..pos].to_string());
+                motivo = "stop";
                 break;
             }
         }
     }
 
-    let finish_reason = if stopped_text.is_some() { "stop" } else { "length" };
+    let finish_reason = motivo;
     let text = stopped_text.unwrap_or_else(|| tok.decode(&generated).unwrap_or_default());
     Generated {
         text,

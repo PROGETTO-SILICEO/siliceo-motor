@@ -96,15 +96,17 @@ in corso finiscono col vecchio modello, le nuove prendono il nuovo. Zero downtim
 - [ ] Test end-to-end curl
 - **Verifica**: cambio temperatura a server acceso, risposta cambia comportamento senza restart
 
-### D6c — Hot-swap modello
-- [ ] `App` dietro RwLock, `POST /v1/model`
-- [ ] Gestione errori: path sbagliato → errore pulito, vecchio modelo resta vivo
-- **Verifica**: swap 0.5B ↔ altro gguf mentre il server gira, nessuna richiesta persa
+### D6c — Hot-swap modello ✅ CHIUSA (commit a592e5f)
+- [x] `App` dietro RwLock, `POST /v1/model`
+- [x] Gestione errori: path sbagliato → errore pulito, vecchio modello resta vivo
+- **Verifica**: Qwen 0.5B ↔ SmolLM2 andata/ritorno a server acceso; bonus: bias opzionali → famiglia llama supportata, parity F1 riverificata
 
-### D6d — Template dinamico (interim tabella, poi Jinja)
-- [ ] tabella famiglie (qwen→ChatML, llama→[INST]...) + override da config
-- [ ] lettura `tokenizer.chat_template` dal GGUF (solo riconoscimento, non rendering Jinja completo)
-- **Verifica**: stesso server, due modelli famiglie diverse → prompt corretti entrambi
+### D6d — Template dinamico ✅ CHIUSA (25/08 notte)
+- [x] rilevamento: config > tokenizer.chat_template nel GGUF > architettura (ChatML, Llama3)
+- [x] riconoscimento per firma nel template GGUF (Jinja completo NON obiettivo ora)
+- [x] BUG SCOPERTO E FIXATO: encode() spezzava i token speciali (<|im_start|> → pezzi BPE sbagliati); ora longest-match prima della regex, test su file reale
+- [x] FIX preesistente: EOS produceva finish_reason "length" invece di "stop"
+- **Verifica**: stesso server, Qwen e SmolLM chattano con prompt codificato giusto; parity raw intatta
 
 ## 7. Decisioni aperte
 
