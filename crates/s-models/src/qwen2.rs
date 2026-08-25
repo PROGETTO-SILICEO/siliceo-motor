@@ -8,7 +8,8 @@
 //! Verifica F1: generazione greedy token-identica a llama.cpp.
 
 use crate::device::Device;
-use crate::kv::KvCache;
+use crate::registry::Famiglia;
+use crate::state::SeqState;
 use s_gguf::GgufFile;
 
 #[derive(Debug, Clone)]
@@ -97,9 +98,14 @@ impl Model {
     /// Carica il modello dequantizzando tutti i pesi in f32.
     pub fn load(path: impl AsRef<std::path::Path>) -> Result<Self, String> {
         let mut gguf = GgufFile::open(path).map_err(|e| e.to_string())?;
+        // dispatch famiglia: rifiuto pulito su architetture non supportate
+        // (mai un forward sbagliato silenzioso). Il mapping cresce in registry.rs.
+        let famiglia = Famiglia::detect(&gguf)?;
         let config = Config::from_gguf(&gguf)?;
         eprintln!(
-            "load: {} layer, {} embd, {} heads ({} kv), {} ffn, eps={}, theta={}",
+            "load: famiglia {} ({}), {} layer, {} embd, {} heads ({} kv), {} ffn, eps={}, theta={}",
+            famiglia.arch(),
+            "dense",
             config.n_layers, config.n_embd, config.n_heads, config.n_kv_heads, config.n_ff,
             config.rms_eps, config.rope_theta
         );
@@ -428,7 +434,7 @@ impl Model {
     /// K/V vengono scritti nella cache e riusati: il decode è O(n), non O(n²).
     ///
     /// Invariante verificato dai test: stesso output esatto di `forward()`.
-    pub fn forward_cached(&self, tokens: &[u32], cache: &mut crate::kv::KvCache) -> Vec<f32> {
+    pub fn forward_cached(&self, tokens: &[u32], cache: &mut SeqState) -> Vec<f32> {
         let c = &self.config;
         let pos0 = cache.len;
         let seq = tokens.len();
@@ -547,17 +553,19 @@ impl Model {
 // ── backend CPU: implementazione del trait Device ──
 
 impl Device for Model {
-    type Cache = KvCache;
+    type Cache = SeqState;
 
     fn config(&self) -> &Config {
         &self.config
     }
 
-    fn new_cache(&self, max_seq: usize) -> KvCache {
-        KvCache::new(&self.config, max_seq)
+    fn new_cache(&self, max_seq: usize) -> SeqState {
+        // qwen2/llama = dense: tutti i layer sono KV (kv_dim per layer)
+        let kv_dim = self.config.n_kv_heads * self.config.head_dim;
+        SeqState::all_kv(self.config.n_layers, kv_dim, max_seq)
     }
 
-    fn forward_cached(&self, tokens: &[u32], cache: &mut KvCache) -> Vec<f32> {
+    fn forward_cached(&self, tokens: &[u32], cache: &mut SeqState) -> Vec<f32> {
         self.forward_cached(tokens, cache)
     }
 }

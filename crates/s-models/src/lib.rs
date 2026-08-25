@@ -6,11 +6,14 @@
 pub mod chat;
 pub mod device;
 pub mod generate;
-pub mod kv;
 pub mod qwen2;
+pub mod registry;
 pub mod sampling;
+pub mod state;
 
 pub use chat::ChatTemplate;
 pub use device::Device;
 pub use qwen2::{Config, Model};
+pub use registry::Famiglia;
 pub use sampling::Sampler;
+pub use state::SeqState;
