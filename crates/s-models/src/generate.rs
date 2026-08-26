@@ -80,6 +80,7 @@ pub fn generate<M: Device>(
     let eos_all: Vec<u32> =
         tok.eos_id().into_iter().chain(params.extra_eos.iter().copied()).collect();
     let mut nessuno = |_: u32| -> bool { true };
+    let mut nomask = || -> Option<Vec<bool>> { None };
     generate_tokens(
         model,
         prompt_ids,
@@ -87,6 +88,7 @@ pub fn generate<M: Device>(
         &eos_all,
         &|ids: &[u32]| tok.decode(ids).unwrap_or_default(),
         &mut nessuno,
+        &mut nomask,
     )
 }
 
@@ -100,6 +102,8 @@ pub fn generate<M: Device>(
 /// consumer, es. client SSE disconnesso): `finish_reason` resta quello raggiunto.
 /// È il punto di aggancio dello streaming agentic (AC-1 in docs/AGENTIC_CORE.md):
 /// UN SOLO loop interno, niente duplicazione del percorso verificato.
+/// `masker`: chiamata PRIMA di ogni sampling; Some(mask) vincola i token
+/// ammessi (AC-3 structured output), None = passo libero.
 pub fn generate_tokens<M: Device>(
     model: &M,
     prompt_ids: &[u32],
@@ -107,6 +111,7 @@ pub fn generate_tokens<M: Device>(
     eos_all: &[u32],
     decode: &dyn Fn(&[u32]) -> String,
     on_token: &mut dyn FnMut(u32) -> bool,
+    masker: &mut dyn FnMut() -> Option<Vec<bool>>,
 ) -> Generated {
     let start = std::time::Instant::now();
     let mut sampler = Sampler::new(params.temperature, params.top_k, params.top_p);
@@ -135,7 +140,11 @@ pub fn generate_tokens<M: Device>(
         if step > 0 {
             next_logits = model.forward_cached(&[last_token], &mut cache);
         }
-        let next = sampler.sample(&next_logits, &mut rng) as u32;
+        let mask = masker();
+        let next = match &mask {
+            Some(m) => sampler.sample_masked(&next_logits, m, &mut rng) as u32,
+            None => sampler.sample(&next_logits, &mut rng) as u32,
+        };
         generated.push(next);
         last_token = next;
 
@@ -251,9 +260,10 @@ mod tests {
         let dev = FakeDevice { config: fake_config(), sequence: vec![3, 9, 15] };
         let params = GenerateParams { max_tokens: 10, ..Default::default() };
         let mut tutti = |_: u32| -> bool { true };
+        let mut nomask = || -> Option<Vec<bool>> { None };
         let out = generate_tokens(&dev, &[1, 2], &params, &[], &|ids| {
             ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",")
-        }, &mut tutti);
+        }, &mut tutti, &mut nomask);
         // prefill + decode: sequenza 3, 9, 15; poi la FakeDevice ripete il
         // token di fallback (7) fino a max_tokens → finish_reason "length"
         assert_eq!(out.ids.len(), 10);
@@ -267,9 +277,10 @@ mod tests {
         let dev = FakeDevice { config: fake_config(), sequence: vec![3, 9] };
         let params = GenerateParams { max_tokens: 10, ..Default::default() };
         let mut tutti = |_: u32| -> bool { true };
+        let mut nomask = || -> Option<Vec<bool>> { None };
         let out = generate_tokens(&dev, &[1], &params, &[9], &|ids| {
             ids.iter().map(|i| i.to_string()).collect()
-        }, &mut tutti);
+        }, &mut tutti, &mut nomask);
         // 3 generato, poi 9 == EOS → stop
         assert_eq!(out.ids, vec![3, 9]);
         assert_eq!(out.finish_reason, "stop");
@@ -285,9 +296,10 @@ mod tests {
             visti.borrow_mut().push(t);
             visti.borrow().len() < 2
         };
+        let mut nomask = || -> Option<Vec<bool>> { None };
         let out = generate_tokens(&dev, &[1], &params, &[], &|ids| {
             ids.iter().map(|i| i.to_string()).collect()
-        }, &mut aborti_dopo_due);
+        }, &mut aborti_dopo_due, &mut nomask);
         assert_eq!(out.ids.len(), 2); // fermata al secondo token, non a max_tokens
         assert_eq!(*visti.borrow(), vec![3, 9]);
         assert_eq!(out.finish_reason, "stop");

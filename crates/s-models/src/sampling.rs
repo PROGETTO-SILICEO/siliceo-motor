@@ -59,6 +59,34 @@ impl Sampler {
         Self { temperature, top_k, top_p }
     }
 
+    /// Campiona con MASCHERA (AC-3): i token con mask[i]==false vengono
+    /// esclusi PRIMA di temperatura/top-k/top-p (vietati = -inf). La greedy
+    /// li salta naturalmente nell'argmax. La maschera è strategia del
+    /// chiamante (es. grammatica JSON); il sampling resta quello verificato.
+    pub fn sample_masked(
+        &mut self,
+        logits: &[f32],
+        mask: &[bool],
+        rng: &mut Rng,
+    ) -> usize {
+        assert_eq!(logits.len(), mask.len(), "mask e logits devono allinearsi");
+        let mut vietati = 0;
+        let masked: Vec<f32> = logits
+            .iter()
+            .zip(mask.iter())
+            .map(|(&l, &ok)| {
+                if ok {
+                    l
+                } else {
+                    vietati += 1;
+                    f32::NEG_INFINITY
+                }
+            })
+            .collect();
+        debug_assert!(vietati < logits.len(), "maschera che vieta TUTTO");
+        self.sample(&masked, rng)
+    }
+
     /// Campiona un token dai logits. Ritorna l'indice del token scelto.
     ///
     /// Nota tie-breaking: su valori identici vince l'indice PIÙ BASSO

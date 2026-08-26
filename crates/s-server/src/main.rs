@@ -16,14 +16,16 @@
 //! Uso: s-server [modello.gguf] [--config PATH] [--port N] [--host H]
 //!      se non c'è --config e esiste ./motor.json viene caricato da solo.
 
+mod grammar;
 mod http;
 mod stream;
+mod tools;
 
 use s_config::json::{parse, write_escaped, Json};
 use s_config::{FileConfig, GenerateDefaults};
 use s_gguf::GgufFile;
 use s_models::chat::ChatTemplate;
-use s_models::generate::{generate, GenerateParams};
+use s_models::generate::GenerateParams;
 use s_models::Model;
 use s_tokenizer::Tokenizer;
 use std::fmt::Write as _;
@@ -39,6 +41,25 @@ struct Inner {
     model_name: String,
     /// Template di chat del modello (D6d): rilevato dal GGUF o dalla config.
     chat: ChatTemplate,
+    /// Tabella id→testo decodificato per il mascheramento grammaticale
+    /// (AC-3): costruita LAZY alla prima richiesta vincolata (~150k decode).
+    vocab_decoded: std::sync::Mutex<Option<std::sync::Arc<Vec<String>>>>,
+}
+
+impl Inner {
+    fn vocab_table(&self) -> std::sync::Arc<Vec<String>> {
+        let mut slot = self.vocab_decoded.lock().unwrap();
+        if let Some(t) = &*slot {
+            return std::sync::Arc::clone(t);
+        }
+        let mut texts = Vec::with_capacity(self.tok.vocab_size());
+        for id in 0..self.tok.vocab_size() as u32 {
+            texts.push(self.tok.decode(&[id]).unwrap_or_default());
+        }
+        let arc = std::sync::Arc::new(texts);
+        *slot = Some(std::sync::Arc::clone(&arc));
+        arc
+    }
 }
 
 impl Inner {
@@ -75,7 +96,13 @@ impl Inner {
             "s-server: {model_name} pronto in {:.1}s",
             t0.elapsed().as_secs_f32()
         );
-        Ok(Arc::new(Self { model, tok, model_name, chat }))
+        Ok(Arc::new(Self {
+            model,
+            tok,
+            model_name,
+            chat,
+            vocab_decoded: std::sync::Mutex::new(None),
+        }))
     }
 }
 
@@ -319,11 +346,11 @@ fn completions(inner: &Inner, app: &App, stream: &mut TcpStream, body: &[u8]) {
     let vuole_stream = j.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
     if vuole_stream {
         // SSE: dopo [DONE] la connessione si chiude — nessuna seconda risposta
-        run_streaming(inner, &ids, &params, stream, false);
+        run_streaming_v(inner, &ids, &params, stream, false, vuole_json(&j));
         return;
     }
 
-    let out = run_generate(inner, &ids, &params);
+    let out = run_generate_con_vincolo(inner, &ids, &params, vuole_json(&j), &mut |_| true);
     respond_json_completion(stream, out.finish_reason, &out.text, ids.len(), &out);
 }
 
@@ -336,24 +363,71 @@ fn chat_completions(inner: &Inner, app: &App, stream: &mut TcpStream, body: &[u8
         Some(m) if !m.is_empty() => m,
         _ => return error(stream, 400, "campo 'messages' mancante o vuoto"),
     };
-    // prompt dal template DEL MODELLO (D6d) + EOS di chat del formato
-    let mut coppie: Vec<(&str, &str)> = Vec::with_capacity(messages.len());
+
+    // ── AC-2: strumenti dichiarati dal client ──
+    let defs = match tools::parse_tools(j.get("tools")) {
+        Ok(t) => t,
+        Err(e) => return error(stream, 400, format!("tools: {e}")),
+    };
+    let usa_tools = !defs.is_empty();
+
+    // ── messaggi → coppie (role, content) per il template ──
+    // assistant con tool_calls → content ricostruito con i tag <tool_call>;
+    // role "tool" → passa tale quale (convenzione hermes/Qwen2.5).
+    let mut coppie: Vec<(String, String)> = Vec::with_capacity(messages.len() + 1);
+    if usa_tools {
+        coppie.push(("system".into(), tools::tools_section(&defs)));
+    }
+    if vuole_json(&j) {
+        // suggerimento lato prompt: la VALIDITÀ la garantisce la maschera,
+        // questo aiuta solo il modello a voler chiudere presto
+        coppie.push(("system".into(), "Respond with only a valid JSON object.".into()));
+    }
     for m in messages {
         let role = m.get("role").and_then(|r| r.as_str()).unwrap_or("");
-        let content = m.get("content").and_then(|c| c.as_str()).unwrap_or("");
-        if role.is_empty() || content.is_empty() {
-            return error(stream, 400, "message senza 'role' o 'content' stringa");
+        if role.is_empty() {
+            return error(stream, 400, "message senza 'role' stringa");
         }
-        coppie.push((role, content));
-    }
-    let prompt = inner.chat.render(&coppie);
+        let mut content =
+            m.get("content").and_then(|c| c.as_str()).unwrap_or("").to_string();
 
-    let params = match params_from_json(app, &j) {
+        if role == "assistant" {
+            // le chiamate fatte dal modello tornano nel prompt come le aveva
+            // scritte: è ciò che i modelli hermes-style si aspettano
+            if let Some(calls) = m.get("tool_calls").and_then(|c| c.as_arr()) {
+                for call in calls {
+                    let name = call.get("function").and_then(|f| f.get("name")).and_then(|n| n.as_str()).unwrap_or("");
+                    let args = call.get("function").and_then(|f| f.get("arguments"));
+                    if name.is_empty() {
+                        continue;
+                    }
+                    let args_json = match args {
+                        Some(a @ Json::Obj(_)) | Some(a @ Json::Arr(_)) => a.dump(),
+                        Some(Json::Str(st)) => st.clone(),
+                        _ => "{}".to_string(),
+                    };
+                    content.push_str("\n<tool_call>\n{\"name\": ");
+                    write_json_str(&mut content, name);
+                    content.push_str(", \"arguments\": ");
+                    content.push_str(&args_json);
+                    content.push_str("}\n</tool_call>");
+                }
+            }
+        }
+
+        if role == "tool" && content.is_empty() {
+            return error(stream, 400, "message role 'tool' senza content");
+        }
+        coppie.push((role.to_string(), content));
+    }
+    let riferimenti: Vec<(&str, &str)> =
+        coppie.iter().map(|(r, c)| (r.as_str(), c.as_str())).collect();
+    let prompt = inner.chat.render(&riferimenti);
+
+    let mut params = match params_from_json(app, &j) {
         Ok(p) => p,
         Err(e) => return error(stream, 400, e),
     };
-    // EOS di chat: i token di chiusura turno del formato attivo
-    let mut params = params;
     for stop in inner.chat.format.stop_tokens() {
         if let Some(id) = inner.tok.token_to_id(stop) {
             params.extra_eos.push(id);
@@ -366,14 +440,29 @@ fn chat_completions(inner: &Inner, app: &App, stream: &mut TcpStream, body: &[u8
     };
 
     let vuole_stream = j.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
-    if vuole_stream {
-        // SSE: dopo [DONE] la connessione si chiude — nessuna seconda risposta
-        run_streaming(inner, &ids, &params, stream, true);
+
+    // ── non-streaming: con tools attivi possiamo rilevare le chiamate ──
+    if !vuole_stream {
+        let json_mode = vuole_json(&j);
+        let out = run_generate_con_vincolo(inner, &ids, &params, json_mode, &mut |_| true);
+        let scan = if usa_tools { tools::scan(&out.text) } else { tools::scan("") };
+        if usa_tools && scan.has_calls() {
+            return respond_json_chat_tool_calls(
+                stream,
+                &scan.content,
+                &scan.calls,
+                ids.len(),
+                &out,
+            );
+        }
+        respond_json_chat(stream, out.finish_reason, &out.text, ids.len(), &out);
         return;
     }
 
-    let out = run_generate(inner, &ids, &params);
-    respond_json_chat(stream, out.finish_reason, &out.text, ids.len(), &out);
+    // ── streaming: il testo passa com'è (i tag <tool_call> inclusi se il
+    // modello li emette; la rilevazione strutturata resta non-streaming).
+    // Documentato in docs/AGENTIC_CORE.md come limite v1 di AC-2. ──
+    run_streaming_v(inner, &ids, &params, stream, true, vuole_json(&j));
 }
 
 // ── streaming SSE (AC-1) ──
@@ -397,12 +486,14 @@ fn chunk_openai(cid: &str, object: &str, body_choice: &str) -> String {
 ///
 /// Il pezzo emesso è il DIFF del decode dell'intera sequenza (sempre UTF-8
 /// valido), filtrato dallo StreamSlicer (trattiene la coda con stop attive).
-fn run_streaming(
+#[allow(clippy::too_many_arguments)]
+fn run_streaming_v(
     inner: &Inner,
     ids: &[u32],
     params: &GenerateParams,
     tcp: &mut TcpStream,
     is_chat: bool,
+    vincolo: bool,
 ) -> Option<s_models::generate::Generated> {
     use http::{respond_sse_open, sse_data, sse_done};
     use stream::StreamSlicer;
@@ -457,8 +548,25 @@ fn run_streaming(
     };
 
     let decode = |g: &[u32]| inner.tok.decode(g).unwrap_or_default();
+    let esiti = std::cell::RefCell::new(if vincolo {
+        Some(grammar::JsonMasker::from_texts(inner.vocab_table()))
+    } else {
+        None
+    });
+    let mut masker = || -> Option<Vec<bool>> {
+        match &*esiti.borrow() {
+            Some(_) => Some(esiti.borrow().as_ref().unwrap().mask()),
+            None => None,
+        }
+    };
+    let mut on_tok = |t: u32| -> bool {
+        if esiti.borrow().is_some() {
+            esiti.borrow_mut().as_mut().unwrap().advance(t);
+        }
+        on_token(t)
+    };
     let out =
-        s_models::generate::generate_tokens(&inner.model, ids, params, &eos_all, &decode, &mut on_token);
+        s_models::generate::generate_tokens(&inner.model, ids, params, &eos_all, &decode, &mut on_tok, &mut masker);
 
     if caduto {
         return None;
@@ -502,16 +610,54 @@ fn escape_json(s: &str) -> String {
 }
 
 
-// ── motore ──
+// ── AC-3: structured output ──
 
-/// Esegue la generazione (bloccante) e ritorna il risultato.
-fn run_generate(
+/// true se la richiesta chiede output JSON vincolato (response_format
+/// json_object | json_schema; per lo schema-specifico vedi docs/AGENTIC_CORE.md).
+fn vuole_json(j: &Json) -> bool {
+    j.get("response_format")
+        .and_then(|rf| rf.get("type"))
+        .and_then(|t| t.as_str())
+        .map(|t| t == "json_object" || t == "json_schema")
+        .unwrap_or(false)
+}
+
+/// Genera con eventuale vincolo grammaticale JSON. Con `None` è la strada
+/// storica (generate). Il vincolo avanza DENTRO la callback del token:
+/// un solo percorso di generazione per tutte le combinazioni.
+#[allow(clippy::too_many_arguments)]
+fn run_generate_con_vincolo(
     inner: &Inner,
     ids: &[u32],
     params: &GenerateParams,
+    vincolo: bool,
+    on_token: &mut dyn FnMut(u32) -> bool,
 ) -> s_models::generate::Generated {
-    generate(&inner.model, &inner.tok, ids, params)
+    let eos_all: Vec<u32> =
+        inner.tok.eos_id().into_iter().chain(params.extra_eos.iter().copied()).collect();
+    let decode = |g: &[u32]| inner.tok.decode(g).unwrap_or_default();
+
+    eprintln!("[ac3] vincolo json attivo: {vincolo}");
+    if !vincolo {
+        let mut nomask = || -> Option<Vec<bool>> { None };
+        return s_models::generate::generate_tokens(
+            &inner.model, ids, params, &eos_all, &decode, on_token, &mut nomask,
+        );
+    }
+
+    let texts = inner.vocab_table();
+    let m = std::cell::RefCell::new(grammar::JsonMasker::from_texts(texts));
+    let mut on_tok = |t: u32| -> bool {
+        m.borrow_mut().advance(t);
+        on_token(t)
+    };
+    let mut mk = || -> Option<Vec<bool>> { Some(m.borrow().mask()) };
+    s_models::generate::generate_tokens(
+        &inner.model, ids, params, &eos_all, &decode, &mut on_tok, &mut mk,
+    )
 }
+
+// ── motore ──
 
 // ── helpers ──
 
@@ -587,6 +733,44 @@ fn usage_json(prompt_tokens: usize, out: &s_models::generate::Generated) -> Stri
         prompt_tokens + out.ids.len(),
         out.tokens_per_sec()
     )
+}
+
+/// Scrive una stringa JSON QUOTATA (virgolette incluse).
+pub(crate) fn write_json_str(out: &mut String, s: &str) {
+    out.push('"');
+    write_escaped(out, s);
+    out.push('"');
+}
+
+fn respond_json_chat_tool_calls(
+    stream: &mut TcpStream,
+    content: &str,
+    calls: &[tools::DetectedCall],
+    prompt_tokens: usize,
+    out: &s_models::generate::Generated,
+) {
+    use std::time::{SystemTime, UNIX_EPOCH};
+    let nano = SystemTime::now().duration_since(UNIX_EPOCH).map(|d| d.as_nanos()).unwrap_or(0);
+    let mut buf = String::new();
+    buf.push_str("{\"id\":");
+    write_escaped(&mut buf, &completion_id());
+    buf.push_str(",\"object\":\"chat.completion\",\"choices\":[{\"index\":0,\"message\":{\"role\":\"assistant\",\"content\":");
+    write_escaped(&mut buf, content);
+    buf.push_str(",\"tool_calls\":[");
+    for (i, c) in calls.iter().enumerate() {
+        if i > 0 {
+            buf.push(',');
+        }
+        let _ = write!(buf, "{{\"id\":\"call_{nano:x}{i}\",\"type\":\"function\",\"function\":{{\"name\":");
+        write_escaped(&mut buf, &c.name);
+        buf.push_str(",\"arguments\":");
+        write_escaped(&mut buf, &c.arguments);
+        buf.push_str("}}");
+    }
+    buf.push_str("]},\"finish_reason\":\"tool_calls\"}],");
+    buf.push_str(&usage_json(prompt_tokens, out));
+    buf.push('}');
+    respond(stream, 200, &buf);
 }
 
 fn completion_id() -> String {
