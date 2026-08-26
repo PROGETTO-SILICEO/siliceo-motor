@@ -51,10 +51,19 @@ snapshot cache fino a n posizioni). Su CPU SeqState clonabile; su device sarà
 copy device-side o seconda area cache.
 
 ## Ordine delle fette verticali
-1. AC-1 streaming (callback + SSE) ← QUESTA SESSIONE
-2. AC-2 tool calling (formato + rilevamento)
-3. AC-3 maschera grammaticale JSON
-4. AC-4 prefix caching
+1. ✅ AC-1 streaming (commit 0b2878b) — verificato live
+2. ✅ AC-2 tool calling (commit 2ff13ba) — round trip completo verificato live
+3. ✅ AC-3 maschera grammaticale JSON (commit 2ff13ba) — 4/4 validi live, streaming incluso
+4. ⬜ AC-4 prefix caching — PROGETTATO:
+
+   - server mantiene una piccola LRU (2-4 voci) di snapshot SeqState
+     (CPU: clonabile; device: copia device-side o seconda area)
+   - chiave = hash dei token del prefisso condiviso (system + primi turni)
+   - a nuova richiesta: longest common prefix con la voce cached →
+     clone con len troncato alla lunghezza comune → prefill solo dal delta
+   - richiede su KvCache/SeqState: `truncate(len)` + `Clone`
+   - invalidazione: hot-swap modello scarta tutta la cache
+   - DA FARE IN SESSIONE FRESCA: è il percorso caldo della generazione
 
 ## Non-fatti (scelti)
 - Niente esecuzione di tool lato server (il server non è un agente).
