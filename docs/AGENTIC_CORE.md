@@ -44,26 +44,35 @@ Il client riceve i token man mano che nascono, non a fine generazione.
   (o set di id vietati) applicata PRIMA di temperatura/sampling — la maschera
   è strategia, il sampling resta quello verificato.
 
-### AC-4 Prefix caching (dopo AC-1..3)
-Prefissi di sistema degli agenti sono enormi e ripetuti: cache KV del prefisso
-riusata tra richieste (lato server: chiave = hash token prefisso, valore =
-snapshot cache fino a n posizioni). Su CPU SeqState clonabile; su device sarà
-copy device-side o seconda area cache.
+### AC-4 Prefix caching ✅ COMPLETATO E VERIFICATO LIVE (26/08)
+
+   - server mantiene una piccola LRU (4 voci, `s-server/src/prefix.rs`) di snapshot SeqState
+     clonati SUBITO DOPO il prefill (callback `on_prefill` di `generate_tokens_seeded`)
+   - riuso = il token-vettore dello snapshot è PREFISSO ESATTO dei token richiesti
+     (confronto al byte, nessun hash che può collidere); vince il prefisso più lungo
+   - `SeqState` ora ha `Clone`, `capacity()`, `truncate(n)` (Err su stati con layer
+     ricorrenti: non possono tornare indietro — F5 deciderà il riuso esatto),
+     `ensure_capacity(n)` (crescita preservando i dati scritti)
+   - **ESTENSIONE DI CAPACITÀ AL VOLO** (scoperta dal test live, invisibile agli unit
+     test): lo snapshot è dimensionato sulla richiesta precedente; la conversazione
+     dell'agente CRECE → al riuso lo stato cresce fino alla capacità richiesta.
+     Senza questo il caso d'uso principale (conversazioni agentiche) mancava la cache
+   - `generate_tokens_seeded`: contratto rigoroso — chi semina garantisce
+     `cache.len() == n` e `n < prompt.len()`; il delta-prefill produce logits IDENTICI
+     per causalità. `Generated.prefix_reused` riporta le posizioni risparmiate
+   - invalidazione: la cache vive in `Inner` → l'hot-swap (D6c) la scarta tutta
+   - VERIFICA LIVE (qwen2.5-0.5B, seed fisso): identica → riuso 53/54 e output
+     identico; conversazione estesa → riuso 54/89 con estensione capacità;
+     server FREDDO == CALDO al byte; streaming non regredisce. Suite: 81 test,
+     3 run stabili, zero warning
+   - BUG COLLEGATO FIXATO (preesistente): due test s-gguf scrivevano lo stesso file
+     temp → gara tra test paralleli (EOF casuale)
 
 ## Ordine delle fette verticali
 1. ✅ AC-1 streaming (commit 0b2878b) — verificato live
 2. ✅ AC-2 tool calling (commit 2ff13ba) — round trip completo verificato live
 3. ✅ AC-3 maschera grammaticale JSON (commit 2ff13ba) — 4/4 validi live, streaming incluso
-4. ⬜ AC-4 prefix caching — PROGETTATO:
-
-   - server mantiene una piccola LRU (2-4 voci) di snapshot SeqState
-     (CPU: clonabile; device: copia device-side o seconda area)
-   - chiave = hash dei token del prefisso condiviso (system + primi turni)
-   - a nuova richiesta: longest common prefix con la voce cached →
-     clone con len troncato alla lunghezza comune → prefill solo dal delta
-   - richiede su KvCache/SeqState: `truncate(len)` + `Clone`
-   - invalidazione: hot-swap modello scarta tutta la cache
-   - DA FARE IN SESSIONE FRESCA: è il percorso caldo della generazione
+4. ✅ AC-4 prefix caching — COMPLETATO E VERIFICATO (26/08, vedi sezione qui sopra)
 
 ## Non-fatti (scelti)
 - Niente esecuzione di tool lato server (il server non è un agente).

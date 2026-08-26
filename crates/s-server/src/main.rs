@@ -18,6 +18,7 @@
 
 mod grammar;
 mod http;
+mod prefix;
 mod stream;
 mod tools;
 
@@ -26,6 +27,7 @@ use s_config::{FileConfig, GenerateDefaults};
 use s_gguf::GgufFile;
 use s_models::chat::ChatTemplate;
 use s_models::generate::GenerateParams;
+use s_models::state::SeqState;
 use s_models::Model;
 use s_tokenizer::Tokenizer;
 use std::fmt::Write as _;
@@ -44,6 +46,9 @@ struct Inner {
     /// Tabella id→testo decodificato per il mascheramento grammaticale
     /// (AC-3): costruita LAZY alla prima richiesta vincolata (~150k decode).
     vocab_decoded: std::sync::Mutex<Option<std::sync::Arc<Vec<String>>>>,
+    /// Snapshot post-prefill riusabili tra richieste (AC-4). Vive in Inner:
+    /// l'hot-swap del modello la scarta tutta, per costruzione.
+    prefix_cache: std::sync::Mutex<prefix::PrefixCache>,
 }
 
 impl Inner {
@@ -102,6 +107,7 @@ impl Inner {
             model_name,
             chat,
             vocab_decoded: std::sync::Mutex::new(None),
+            prefix_cache: std::sync::Mutex::new(prefix::PrefixCache::new(4)),
         }))
     }
 }
@@ -569,8 +575,18 @@ fn run_streaming_v(
         }
         on_token(t)
     };
-    let out =
-        s_models::generate::generate_tokens(&inner.model, ids, params, &eos_all, &decode, &mut on_tok, &mut masker);
+    let mut on_prefill = prefix_store(inner, ids);
+    let out = s_models::generate::generate_tokens_seeded(
+        &inner.model,
+        ids,
+        params,
+        &eos_all,
+        &decode,
+        &mut on_tok,
+        &mut masker,
+        prefix_seed(inner, ids, params.max_tokens),
+        &mut on_prefill,
+    );
 
     if caduto {
         return None;
@@ -622,6 +638,29 @@ fn escape_json(s: &str) -> String {
 }
 
 
+// ── AC-4: prefix caching ──
+
+/// Seme prefix-cache per una richiesta: lo snapshot col prefisso comune più
+/// lungo, GIÀ troncato e verificato in capacità secondo il contratto di
+/// `generate_tokens_seeded`. None = prefill pieno.
+fn prefix_seed(inner: &Inner, ids: &[u32], max_tokens: usize) -> Option<(SeqState, usize)> {
+    let need = ids.len().saturating_add(max_tokens);
+    let seme = inner.prefix_cache.lock().unwrap().find(ids, need);
+    if let Some((_, n)) = &seme {
+        eprintln!("prefix cache: riuso {n}/{} token del prompt", ids.len());
+    }
+    seme
+}
+
+/// Callback `on_prefill` che memorizza lo snapshot post-prefill per le
+/// richieste future (la LRU interna scarta le voci corte e le meno usate).
+fn prefix_store<'a>(inner: &'a Inner, ids: &[u32]) -> impl for<'b> FnMut(&'b SeqState) + 'a {
+    let tokens = ids.to_vec();
+    move |st: &SeqState| {
+        inner.prefix_cache.lock().unwrap().store(tokens.clone(), st.clone());
+    }
+}
+
 // ── AC-3: structured output ──
 
 /// true se la richiesta chiede output JSON vincolato (response_format
@@ -651,8 +690,17 @@ fn run_generate_con_vincolo(
 
     if !vincolo {
         let mut nomask = || -> Option<Vec<bool>> { None };
-        return s_models::generate::generate_tokens(
-            &inner.model, ids, params, &eos_all, &decode, on_token, &mut nomask,
+        let mut on_prefill = prefix_store(inner, ids);
+        return s_models::generate::generate_tokens_seeded(
+            &inner.model,
+            ids,
+            params,
+            &eos_all,
+            &decode,
+            on_token,
+            &mut nomask,
+            prefix_seed(inner, ids, params.max_tokens),
+            &mut on_prefill,
         );
     }
 
@@ -666,8 +714,17 @@ fn run_generate_con_vincolo(
         on_token(t) && !m.borrow().is_done()
     };
     let mut mk = || -> Option<Vec<bool>> { Some(m.borrow().mask()) };
-    let mut out = s_models::generate::generate_tokens(
-        &inner.model, ids, params, &eos_all, &decode, &mut on_tok, &mut mk,
+    let mut on_prefill = prefix_store(inner, ids);
+    let mut out = s_models::generate::generate_tokens_seeded(
+        &inner.model,
+        ids,
+        params,
+        &eos_all,
+        &decode,
+        &mut on_tok,
+        &mut mk,
+        prefix_seed(inner, ids, params.max_tokens),
+        &mut on_prefill,
     );
 
     // AUTO-RIPARAZIONE: se max_tokens taglia a JSON incompleto (prefisso

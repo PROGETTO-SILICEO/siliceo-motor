@@ -106,7 +106,9 @@ fn header_and_metadata() {
 
 #[test]
 fn tensor_infos_and_lazy_data() {
-    let path = write_temp_named("main", &build_test_gguf());
+    // nome UNICO: "main" era condiviso con header_and_metadata → gara su file
+    // temp tra test paralleli (EOF casuale, beccato durante AC-4)
+    let path = write_temp_named("tensor_infos", &build_test_gguf());
     let mut f = GgufFile::open(&path).unwrap();
 
     let w0 = f.tensor("w0").unwrap();

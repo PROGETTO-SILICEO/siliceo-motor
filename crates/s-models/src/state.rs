@@ -17,6 +17,7 @@
 //! forward: per le architetture dense tutto deve restare bit-identico.
 
 /// Stato di UN singolo layer per la sequenza corrente.
+#[derive(Clone)]
 pub enum LayerSeq {
     /// Attenzione: K e V pre-allocati `[max_seq × dim]`.
     /// Usato da ogni layer attention, full o parziale che sia.
@@ -29,6 +30,7 @@ pub enum LayerSeq {
 }
 
 /// Buffers K/V di un layer attention: `[max_seq × dim]` ciascuno.
+#[derive(Clone)]
 pub struct LayerKv {
     k: Vec<f32>,
     v: Vec<f32>,
@@ -36,6 +38,7 @@ pub struct LayerKv {
 }
 
 /// Stato ricorrente: buffer piatto + shape logica.
+#[derive(Clone)]
 pub struct RecurrentState {
     data: Vec<f32>,
     /// shape logica (es. `[n_heads, d_state, d_head]`). Solo documentale finché
@@ -48,6 +51,11 @@ pub struct RecurrentState {
 /// Sostituisce `kv::KvCache` (che gestiva solo il caso tutti-KV).
 /// La posizione assoluta della sequenza resta unica per tutti i layer:
 /// in regime autoregressivo i layer avanzano insieme.
+///
+/// `Clone` serve al prefix caching del server (AC-4): lo snapshot
+/// post-prefill è una copia completa dei buffer, riusabile come seme
+/// per le richieste che condividono lo stesso prefisso.
+#[derive(Clone)]
 pub struct SeqState {
     layers: Vec<LayerSeq>,
     /// Numero di posizioni già scritte (lunghezza sequenza processata).
@@ -80,6 +88,28 @@ impl LayerKv {
     /// Slice V delle prime `n_positions` posizioni (zona lettura).
     pub(crate) fn v_upto(&self, n_positions: usize) -> &[f32] {
         &self.v[..n_positions * self.dim]
+    }
+    /// Posizioni allocabili del layer (= il `max_seq` di costruzione).
+    pub(crate) fn capacity(&self) -> usize {
+        self.k.len() / self.dim
+    }
+
+    /// Cresce i buffer fino a ospitare `min_capacity` posizioni, PRESERVANDO
+    /// i dati già scritti (le posizioni 0..len contengono K/V vere; oltre
+    /// `len` non c'è mai niente da preservare perché il forward causale non
+    /// legge mai la zona non scritta).
+    ///
+    /// Serve al riuso del prefix caching: uno snapshot dimensionato sulla
+    /// richiesta precedente è quasi sempre troppo corto per la richiesta
+    /// nuova (la conversazione dell'agente CRECE). Scoperto dal test live,
+    /// non dagli unit test.
+    pub(crate) fn ensure(&mut self, min_capacity: usize) {
+        let cap = self.capacity();
+        if min_capacity <= cap {
+            return;
+        }
+        self.k.resize(min_capacity * self.dim, 0.0);
+        self.v.resize(min_capacity * self.dim, 0.0);
     }
 }
 
@@ -185,7 +215,12 @@ impl SeqState {
     }
 
     /// Avanza la lunghezza dopo aver scritto `n` nuove posizioni.
-    pub(crate) fn advance(&mut self, n: usize) {
+    ///
+    /// Pubblico dal AC-4: il server (prefix cache) è un consumatore
+    /// legittimo del contratto "chi possiede lo stato lo allinea" —
+    /// il seme consegnato a generate_tokens_seeded deve avere
+    /// `len() == n`, e allinearlo passa da qui.
+    pub fn advance(&mut self, n: usize) {
         self.len += n;
     }
 
@@ -200,6 +235,59 @@ impl SeqState {
                 r.data.fill(0.0);
             }
         }
+    }
+
+    /// Posizioni massime ospitabili dallo stato: la più stretta tra i layer KV.
+    /// Gli stati solo-ricorrenti non crescono con la sequenza → capacità infinita.
+    #[allow(dead_code)] // consumato dal server (AC-4); il test lo copre
+    pub fn capacity(&self) -> usize {
+        self.layers
+            .iter()
+            .map(|l| match l {
+                LayerSeq::Kv(kv) => kv.capacity(),
+                LayerSeq::Recurrent(_) => usize::MAX,
+            })
+            .min()
+            .unwrap_or(usize::MAX)
+    }
+
+    /// Cresce lo stato fino a `min_capacity` posizioni (layer KV soltanto;
+    /// quelli ricorrenti hanno dimensione fissa e non ne hanno bisogno).
+    /// Vedi `LayerKv::ensure` per il perché e la garanzia sui dati.
+    pub fn ensure_capacity(&mut self, min_capacity: usize) {
+        for l in &mut self.layers {
+            if let LayerSeq::Kv(kv) = l {
+                kv.ensure(min_capacity);
+            }
+        }
+    }
+
+    /// Accorcia lo stato alle prime `len` posizioni processate.
+    ///
+    /// Valido SOLO su stati tutti-KV: le posizioni oltre `len` non vengono mai
+    /// lette dal forward causale, quindi "dimenticare la coda" è gratis.
+    /// Uno stato RICORRENTE porta memoria compatta non posizionale: NON può
+    /// tornare a uno stato precedente — restituisce Err e non tocca nulla.
+    ///
+    /// È l'operazione che permette al prefix caching di riusare uno snapshot
+    /// anche quando il prefisso comune è più corto dello snapshot stesso,
+    /// purché lo stato sia troncabile.
+    pub fn truncate(&mut self, len: usize) -> Result<(), String> {
+        if len > self.len {
+            return Err(format!(
+                "truncate: {len} > len={} (allungare uno stato è senza senso)",
+                self.len
+            ));
+        }
+        if self.layers.iter().any(|l| matches!(l, LayerSeq::Recurrent(_))) {
+            return Err(
+                "truncate: lo stato ha layer ricorrenti, che non possono tornare \
+                 indietro (la loro memoria non è posizionale)"
+                    .to_string(),
+            );
+        }
+        self.len = len;
+        Ok(())
     }
 }
 
@@ -276,5 +364,72 @@ mod tests {
         let layers = vec![LayerSeq::Kv(LayerKv::new(4, 8))];
         let mut st = SeqState::from_layers(layers);
         let _ = st.layer_recurrent_mut(0);
+    }
+
+    // ── AC-4 prefix caching: clone, capacity, truncate ──
+
+    #[test]
+    fn capacity_e_il_max_seq_dei_layer_kv() {
+        assert_eq!(SeqState::all_kv(3, 4, 16).capacity(), 16);
+        // solo ricorrente: capacità infinita (lo stato non cresce con la seq)
+        let rec = vec![LayerSeq::Recurrent(RecurrentState::zeroed([1, 8, 8]))];
+        assert_eq!(SeqState::from_layers(rec).capacity(), usize::MAX);
+        // misto: la più stretta tra i layer KV
+        let misto = vec![
+            LayerSeq::Kv(LayerKv::new(4, 32)),
+            LayerSeq::Recurrent(RecurrentState::zeroed([1, 8, 8])),
+            LayerSeq::Kv(LayerKv::new(4, 8)),
+        ];
+        assert_eq!(SeqState::from_layers(misto).capacity(), 8);
+    }
+
+    #[test]
+    fn truncate_accorcia_lo_stato_tutti_kv() {
+        let mut st = SeqState::all_kv(2, 4, 16);
+        st.layer_k_mut(0)[..12].copy_from_slice(&[1.0; 12]);
+        st.advance(3);
+        st.truncate(1).unwrap();
+        assert_eq!(st.len, 1);
+        // la zona oltre len non è letta dal forward causale: qui verifichiamo
+        // solo che il contratto posizionale regga — riscrivere da len=1 funziona
+        st.layer_k_mut(0)[..4].copy_from_slice(&[7.0; 4]);
+        assert_eq!(st.layer_k_upto(0, 2)[4..8], [7.0; 4]);
+    }
+
+    #[test]
+    fn truncate_rifiuta_stati_con_layer_ricorrenti_senza_toccarli() {
+        let mut st = SeqState::from_layers(vec![
+            LayerSeq::Kv(LayerKv::new(4, 8)),
+            LayerSeq::Recurrent(RecurrentState::zeroed([1, 4, 4])),
+        ]);
+        st.advance(5);
+        let err = st.truncate(2).unwrap_err();
+        assert!(err.contains("ricorrenti"), "messaggio fuorviante: {err}");
+        // lo stato resta INTATTO dopo il rifiuto
+        assert_eq!(st.len, 5);
+    }
+
+    #[test]
+    fn truncate_rifiuta_allungamenti() {
+        let mut st = SeqState::all_kv(1, 4, 8);
+        st.advance(2);
+        assert!(st.truncate(3).is_err());
+        assert_eq!(st.len, 2);
+    }
+
+    #[test]
+    fn clone_indipendente_prefix_cache() {
+        let mut st = SeqState::all_kv(1, 4, 16);
+        st.layer_k_mut(0)[..8].copy_from_slice(&[1.0; 8]);
+        st.advance(2);
+        let snap = st.clone();
+        // l'originale avanza: lo snapshot NON deve muoversi con lui.
+        // (la slice di layer_k_mut è GIÀ offsettata a len*dim → [..4] = pos 2)
+        st.layer_k_mut(0)[..4].copy_from_slice(&[9.0; 4]);
+        st.advance(1);
+        assert_eq!(snap.len, 2);
+        assert_eq!(&snap.layer_k_upto(0, 2)[..8], &[1.0; 8]);
+        assert_eq!(st.len, 3);
+        assert_eq!(st.layer_k_upto(0, 3)[8..12], [9.0; 4]);
     }
 }
