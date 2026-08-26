@@ -17,6 +17,7 @@
 //!      se non c'è --config e esiste ./motor.json viene caricato da solo.
 
 mod http;
+mod stream;
 
 use s_config::json::{parse, write_escaped, Json};
 use s_config::{FileConfig, GenerateDefaults};
@@ -315,6 +316,13 @@ fn completions(inner: &Inner, app: &App, stream: &mut TcpStream, body: &[u8]) {
         Err(e) => return error(stream, 400, e.to_string()),
     };
 
+    let vuole_stream = j.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    if vuole_stream {
+        // SSE: dopo [DONE] la connessione si chiude — nessuna seconda risposta
+        run_streaming(inner, &ids, &params, stream, false);
+        return;
+    }
+
     let out = run_generate(inner, &ids, &params);
     respond_json_completion(stream, out.finish_reason, &out.text, ids.len(), &out);
 }
@@ -357,9 +365,142 @@ fn chat_completions(inner: &Inner, app: &App, stream: &mut TcpStream, body: &[u8
         Err(e) => return error(stream, 400, e.to_string()),
     };
 
+    let vuole_stream = j.get("stream").and_then(|v| v.as_bool()).unwrap_or(false);
+    if vuole_stream {
+        // SSE: dopo [DONE] la connessione si chiude — nessuna seconda risposta
+        run_streaming(inner, &ids, &params, stream, true);
+        return;
+    }
+
     let out = run_generate(inner, &ids, &params);
     respond_json_chat(stream, out.finish_reason, &out.text, ids.len(), &out);
 }
+
+// ── streaming SSE (AC-1) ──
+
+/// Un chunk SSE in formato OpenAI. `body_choice` è il contenuto interno
+/// dell'oggetto choice GIÀ COMPLETO (delta/text + finish_reason).
+fn chunk_openai(cid: &str, object: &str, body_choice: &str) -> String {
+    let mut buf = String::new();
+    buf.push_str("{\"id\":");
+    write_escaped(&mut buf, cid);
+    buf.push_str(",\"object\":");
+    write_escaped(&mut buf, object);
+    buf.push_str(",\"choices\":[{");
+    buf.push_str(body_choice);
+    buf.push_str("}]}");
+    buf
+}
+
+/// Generazione con invio dei pezzi man mano. Ritorna il Generated completo
+/// oppure None se la connessione SSE è caduta durante l'invio.
+///
+/// Il pezzo emesso è il DIFF del decode dell'intera sequenza (sempre UTF-8
+/// valido), filtrato dallo StreamSlicer (trattiene la coda con stop attive).
+fn run_streaming(
+    inner: &Inner,
+    ids: &[u32],
+    params: &GenerateParams,
+    tcp: &mut TcpStream,
+    is_chat: bool,
+) -> Option<s_models::generate::Generated> {
+    use http::{respond_sse_open, sse_data, sse_done};
+    use stream::StreamSlicer;
+
+    if respond_sse_open(tcp).is_err() {
+        return None;
+    }
+
+    let cid = completion_id();
+    let object = if is_chat { "chat.completion.chunk" } else { "text_completion.chunk" };
+
+    // primo chunk: ruolo (convenzione OpenAI per chat; delta vuoto per completions)
+    let primo = if is_chat {
+        chunk_openai(&cid, object, "\"index\":0,\"delta\":{\"role\":\"assistant\"},\"finish_reason\":null")
+    } else {
+        chunk_openai(&cid, object, "\"text\":\"\",\"finish_reason\":null")
+    };
+    if sse_data(tcp, &primo).is_err() {
+        return None;
+    }
+
+    let eos_all: Vec<u32> =
+        inner.tok.eos_id().into_iter().chain(params.extra_eos.iter().copied()).collect();
+    let slicer = std::cell::RefCell::new(StreamSlicer::new(&params.stop));
+    let generati: std::cell::RefCell<Vec<u32>> = std::cell::RefCell::new(Vec::new());
+    let mut caduto = false;
+
+    let tok = &inner.tok;
+    let mut on_token = |t: u32| -> bool {
+        generati.borrow_mut().push(t);
+        let full = tok.decode(&generati.borrow()).unwrap_or_default();
+        let piece = slicer.borrow_mut().push(&full);
+        if !piece.is_empty() {
+            let mut body = String::new();
+            if is_chat {
+                body.push_str("\"index\":0,\"delta\":{\"content\":");
+                write_escaped(&mut body, &piece);
+                body.push_str("},");
+            } else {
+                body.push_str("\"text\":");
+                write_escaped(&mut body, &piece);
+                body.push(',');
+            }
+            body.push_str("\"finish_reason\":null");
+            let chunk = chunk_openai(&cid, object, &body);
+            if sse_data(tcp, &chunk).is_err() {
+                caduto = true;
+                return false; // client andato: ferma la generazione
+            }
+        }
+        true
+    };
+
+    let decode = |g: &[u32]| inner.tok.decode(g).unwrap_or_default();
+    let out =
+        s_models::generate::generate_tokens(&inner.model, ids, params, &eos_all, &decode, &mut on_token);
+
+    if caduto {
+        return None;
+    }
+
+    // coda trattenuta dalle stop-strings, poi chunk finale con finish_reason.
+    // ATTENZIONE: si usa out.text (GIÀ TRONCATO alle stop dal loop), mai il
+    // decode integrale degli id — altrimenti si emette ciò che la stop voleva
+    // nascondere (bug trovato dal test live con stop=["capitale"]).
+    let full = &out.text;
+    let coda = slicer.borrow_mut().finish(full);
+    if !coda.is_empty() {
+        let mut body = String::new();
+        if is_chat {
+            body.push_str("\"index\":0,\"delta\":{\"content\":");
+            write_escaped(&mut body, &coda);
+            body.push_str("},");
+        } else {
+            body.push_str("\"text\":");
+            write_escaped(&mut body, &coda);
+            body.push(',');
+        }
+        body.push_str("\"finish_reason\":null");
+        let _ = sse_data(tcp, &chunk_openai(&cid, object, &body));
+    }
+    let finale = chunk_openai(
+        &cid,
+        object,
+        &format!("\"index\":0,\"delta\":{{}},\"finish_reason\":{}", escape_json(out.finish_reason)),
+    );
+    let _ = sse_data(tcp, &finale);
+    let _ = sse_done(tcp);
+    Some(out)
+}
+
+/// Stringa JSON già quotata per valori noti e sicuri ("stop"/"length").
+fn escape_json(s: &str) -> String {
+    let mut buf = String::new();
+    write_escaped(&mut buf, s);
+    buf
+}
+
 
 // ── motore ──
 

@@ -70,3 +70,30 @@ pub fn respond_json(stream: &mut TcpStream, status: u16, reason: &str, body: &st
     let _ = stream.write_all(response.as_bytes());
     let _ = stream.flush();
 }
+
+// ── SSE (AC-1) ──
+
+/// Header di apertura stream SSE: delimitazione da EOF via Connection: close.
+pub fn respond_sse_open(stream: &mut TcpStream) -> std::io::Result<()> {
+    stream.write_all(
+        b"HTTP/1.1 200 OK\r\n\
+          Content-Type: text/event-stream\r\n\
+          Cache-Control: no-cache\r\n\
+          Connection: close\r\n\r\n",
+    )?;
+    stream.flush()
+}
+
+/// Un evento `data: <json>\n\n` con flush immediato.
+pub fn sse_data(stream: &mut TcpStream, json: &str) -> std::io::Result<()> {
+    stream.write_all(b"data: ")?;
+    stream.write_all(json.as_bytes())?;
+    stream.write_all(b"\n\n")?;
+    stream.flush()
+}
+
+/// Evento di terminazione OpenAI-compatible.
+pub fn sse_done(stream: &mut TcpStream) -> std::io::Result<()> {
+    stream.write_all(b"data: [DONE]\n\n")?;
+    stream.flush()
+}

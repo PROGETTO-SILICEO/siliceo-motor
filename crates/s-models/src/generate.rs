@@ -79,24 +79,34 @@ pub fn generate<M: Device>(
 ) -> Generated {
     let eos_all: Vec<u32> =
         tok.eos_id().into_iter().chain(params.extra_eos.iter().copied()).collect();
-    generate_tokens(model, prompt_ids, params, &eos_all, &|ids: &[u32]| {
-        tok.decode(ids).unwrap_or_default()
-    })
+    let mut nessuno = |_: u32| -> bool { true };
+    generate_tokens(
+        model,
+        prompt_ids,
+        params,
+        &eos_all,
+        &|ids: &[u32]| tok.decode(ids).unwrap_or_default(),
+        &mut nessuno,
+    )
 }
 
 /// Nucleo del loop, indipendente dal Tokenizer: riceve l'insieme EOS e una
 /// funzione di decodifica. Serve ai test con backend finti e a F3 (la
 /// decodifica resta host-side qualunque sia il device).
 ///
-/// Usa la KV cache incrementale del backend: prefill una volta sola, poi un
-/// token per passo. Su CPU l'output è identico al full-recompute (verificato);
-/// ogni nuovo backend deve passare lo stesso test greedy multi-token.
+///
+/// `on_token`: chiamata per OGNI token generato (dopo il sampling, prima delle
+/// stop conditions). Ritorna false per interrompere la generazione (abort del
+/// consumer, es. client SSE disconnesso): `finish_reason` resta quello raggiunto.
+/// È il punto di aggancio dello streaming agentic (AC-1 in docs/AGENTIC_CORE.md):
+/// UN SOLO loop interno, niente duplicazione del percorso verificato.
 pub fn generate_tokens<M: Device>(
     model: &M,
     prompt_ids: &[u32],
     params: &GenerateParams,
     eos_all: &[u32],
     decode: &dyn Fn(&[u32]) -> String,
+    on_token: &mut dyn FnMut(u32) -> bool,
 ) -> Generated {
     let start = std::time::Instant::now();
     let mut sampler = Sampler::new(params.temperature, params.top_k, params.top_p);
@@ -128,6 +138,12 @@ pub fn generate_tokens<M: Device>(
         let next = sampler.sample(&next_logits, &mut rng) as u32;
         generated.push(next);
         last_token = next;
+
+        // streaming: il consumer può fermare la generazione (false = abort)
+        if !on_token(next) {
+            motivo = "stop";
+            break;
+        }
 
         if eos_all.contains(&next) {
             motivo = "stop";
@@ -234,9 +250,10 @@ mod tests {
     fn loop_generico_attraverso_il_trait() {
         let dev = FakeDevice { config: fake_config(), sequence: vec![3, 9, 15] };
         let params = GenerateParams { max_tokens: 10, ..Default::default() };
+        let mut tutti = |_: u32| -> bool { true };
         let out = generate_tokens(&dev, &[1, 2], &params, &[], &|ids| {
             ids.iter().map(|i| i.to_string()).collect::<Vec<_>>().join(",")
-        });
+        }, &mut tutti);
         // prefill + decode: sequenza 3, 9, 15; poi la FakeDevice ripete il
         // token di fallback (7) fino a max_tokens → finish_reason "length"
         assert_eq!(out.ids.len(), 10);
@@ -249,11 +266,30 @@ mod tests {
     fn loop_generico_eos_attraverso_il_trait() {
         let dev = FakeDevice { config: fake_config(), sequence: vec![3, 9] };
         let params = GenerateParams { max_tokens: 10, ..Default::default() };
+        let mut tutti = |_: u32| -> bool { true };
         let out = generate_tokens(&dev, &[1], &params, &[9], &|ids| {
             ids.iter().map(|i| i.to_string()).collect()
-        });
+        }, &mut tutti);
         // 3 generato, poi 9 == EOS → stop
         assert_eq!(out.ids, vec![3, 9]);
+        assert_eq!(out.finish_reason, "stop");
+    }
+
+    /// AC-1: la callback può interrompere la generazione (abort consumer).
+    #[test]
+    fn callback_false_interrompe_la_generazione() {
+        let dev = FakeDevice { config: fake_config(), sequence: vec![3, 9, 15] };
+        let params = GenerateParams { max_tokens: 10, ..Default::default() };
+        let visti = std::cell::RefCell::new(Vec::new());
+        let mut aborti_dopo_due = |t: u32| -> bool {
+            visti.borrow_mut().push(t);
+            visti.borrow().len() < 2
+        };
+        let out = generate_tokens(&dev, &[1], &params, &[], &|ids| {
+            ids.iter().map(|i| i.to_string()).collect()
+        }, &mut aborti_dopo_due);
+        assert_eq!(out.ids.len(), 2); // fermata al secondo token, non a max_tokens
+        assert_eq!(*visti.borrow(), vec![3, 9]);
         assert_eq!(out.finish_reason, "stop");
     }
 }
