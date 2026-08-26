@@ -7,7 +7,7 @@
 //! ricorrente a dimensione fissa, indipendente dalla lunghezza della
 //! sequenza.
 //!
-//! Perché ORA (roadmap v2, roadmap v2 del 25/08): rifattorizzare
+//! Perché ORA (roadmap v2 del 25/08): rifattorizzare
 //! stato+trait+runtime DOPO che server/hot-swap/generate toccano il modello
 //! costa giorni; anticipare l'astrazione prima di chiudere F3b step 4 costa ore.
 //!

@@ -23,7 +23,7 @@
 //!   stadio finale condiviso; host RAM abbondante, accettabile ora.
 //!
 //! NOTA drop-order: `core` è il primo campo, stesso assetto dei smoke test
-//! verdi su la GPU di prova (l'ordine di drop dei buffer cust segue la dichiarazione).
+//! verdi su GPU (l'ordine di drop dei buffer cust segue la dichiarazione).
 
 // macro testuale: DEVE precedere l'uso nel file (scoping testuale).
 // Versione panicking: un launch fallito è fatale per il forward (kernel
@@ -945,7 +945,7 @@ mod tests {
     /// TEST DEFINITIVO F3b step 4: generazione greedy multi-token su GPU
     /// identica al CPU (che è parity llama.cpp da F1/F2).
     ///
-    /// Attivazione (su la GPU di prova, modello presente):
+    /// Attivazione (su GPU, modello presente):
     ///   S_CUDA_QWEN05B=/percorso/modello-q4km.gguf \
     ///     cargo test -p s-backend-cuda --features cuda --release \
     ///     -- --nocapture --ignored gpu_forward_generazione_identica_al_cpu
