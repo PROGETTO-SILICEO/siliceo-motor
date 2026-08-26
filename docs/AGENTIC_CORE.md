@@ -1,7 +1,7 @@
 # AGENTIC CORE — progetto (fase 3 roadmap v2)
 
-Data: 2026-08-26 · Decisione roadmap v2 (promozione al posto 3): "tutto è agentic ora,
-anche tu". Il carico dominante 2026 è agentico ; un serving
+Data: 2026-08-26 · Decisione roadmap v2 (promozione al posto 3): "tutto è agentic ora".
+Il carico dominante 2026 è agentico; un serving
 senza tool calling è autoesclusione. NON è feature-race: tocca il MOTORE
 (sampling vincolato, prefix caching, streaming parziale).
 

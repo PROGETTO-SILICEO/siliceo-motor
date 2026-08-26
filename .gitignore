@@ -1,2 +1,4 @@
 target/
 *.gguf
+docs/MOTORE_SOVRANO_PIANO.md
+scripts/test-cuda-*.sh

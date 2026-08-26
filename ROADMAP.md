@@ -37,6 +37,20 @@ un test che la dimostri. F0–F2.5 e la configurazione dinamica sono completate 
 - **Verifica**: swap Qwen 0.5B ↔ SmolLM2 135M a server acceso; patch runtime applicata
   alla generazione successiva; parity logits invariata dopo ogni modifica
 
+## ✅ Agentic Core (AC-1..4)
+
+Il carico dominante è agentico: il serving nasce per i tool, non li aggiunge dopo.
+Dettagli in [docs/AGENTIC_CORE.md](docs/AGENTIC_CORE.md).
+
+- ✅ **AC-1 Streaming SSE**: `stream: true` su completions e chat; output byte-identico
+  al non-streaming con seed fisso; stop conditions zero-leak; chunking EOF-delimited
+- ✅ **AC-2 Tool calling**: definizioni tools → sampling vincolato per chiamate sintatticamente valide
+- ✅ **AC-3 Structured output**: `response_format` json_schema — risposta conforme garantita
+- ✅ **AC-4 Prefix caching**: snapshot LRU post-prefill; riuso del prefisso esatto con
+  estensione capacitiva lazy al momento del riuso (le conversazioni crescono, lo stato cresce con loro)
+- **Verifica live**: sequenza miss→hit→hit con estensione capacità; server caldo == server
+  freddo al byte; streaming intatto dopo la modifica
+
 ## 🚧 F3 — Backend CUDA (kernel scritti in Rust, compilati a PTX/cubin)
 - ✅ Astrazione `Device`: forward e generazione backend-agnostici (CPU oggi, CUDA/Vulkan domani)
 - ✅ Pipeline kernel sovrana operativa: Rust → rustc_codegen_nvvm → PTX → ptxas → cubin

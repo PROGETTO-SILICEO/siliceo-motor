@@ -1,7 +1,7 @@
 # D6 — Configurazione Dinamica: un motore per tutto
 
-**Data:** 2026-08-25 · **Stato:** Design (da approvare)
-"Direttiva di progetto:" *"il motore deve raccogliere il meglio degli altri anche mettendo
+**Data:** 2026-08-25 · **Stato:** Design approvato
+**Direttiva di progetto:** *"il motore deve raccogliere il meglio degli altri anche mettendo
 un metodo di configurazione dinamica. devono usarne uno per tutto."*
 
 ---

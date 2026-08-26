@@ -1,6 +1,6 @@
 //! s-gguf — lettore GGUF nativo completo per siliceo-motor.
 //!
-//! F0 del piano MOTORE_SOVRANO. Verifica F0: legge un GGUF reale ed elenca
+//! F0 (parser GGUF). Verifica F0: legge un GGUF reale ed elenca
 //! tensori identici a llama.cpp.
 //!
 //! Principi (dal piano):

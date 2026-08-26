@@ -30,7 +30,6 @@ llama.cpp fa lo stesso da anni; lo facciamo con kernels nostri (D1).
 
 ### F3b — forward f16/f32 su GPU, parity (prima settimana su hardware)
 Hardware: banco di prova RTX 3090 24GB, CUDA 12.4.
-Build+test: `bash scripts/test-cuda-ai3.sh`.
 
 FATTO (25/08):
 - ✅ CudaCtx (init driver, contesto primario, describe per /health)
@@ -79,8 +78,7 @@ PROSSIMO (restante F3b):
 | argmax/sample | logits [vocab] | greedy su device; sampling resta host |
 
 ## Aperto / decisioni pendenti
-***REMOVED***
- serve setup lì (o password una volta).→ serve setup lì (o password una volta).
+1. **Accesso al secondo nodo GPU**: chiave non ancora autorizzata → serve setup.
 2. nodo-inferenza (2070) era offline stamattina: riaccenderlo se serve come
    secondo banco CUDA (sm_75, buona copertura compatibilità).
 3. Architettura compute della 3090 = sm_86: verificare versione CUDA toolkit

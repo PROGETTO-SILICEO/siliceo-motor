@@ -7,17 +7,17 @@
 //! 1. cuda_builder compila il crate `kernels/` (Rust) a PTX — strada D1:
 //!    kernel scritti in Rust, nightly pinnato in kernels/rust-toolchain.toml.
 //! 2. ptxas converte il PTX in cubin — il driver dei nodi non ha JIT PTX
-//!    (CUDA_ERROR_JIT_COMPILER_NOT_FOUND su la GPU di prova) e comunque evitare il JIT
-//!    a runtime è la scelta giusta per un motore di inferenza.
+//!    (CUDA_ERROR_JIT_COMPILER_NOT_FOUND su GPU senza ptxas aggiornato) e comunque
+//!    evitare il JIT a runtime è la scelta giusta per un motore di inferenza.
 //!
 //! Requisiti sulla macchina di build: CUDA toolkit (ptxas) + toolchain
 //! nightly pinnata con rust-src/rustc-dev/llvm-tools-preview. Il comando
 //! cargo va lanciato con quella toolchain (es. `cargo +nightly-2026-04-02`),
 //! altrimenti la compilazione del backend codegen fallisce per mismatch di
-//! interni rustc. Vedi scripts/test-cuda-ai3.sh per l'ambiente completo.
+//! interni rustc.
 //!
-//! Architettura: env `SILICEO_CUDA_ARCH`, default `sm_86` (RTX 3090).
-//! Per il nodo inferenza 2070: SILICEO_CUDA_ARCH=sm_75.
+//! Architettura: env `SILICEO_CUDA_ARCH`, default `sm_86` (RTX 3090);
+//! per GPU più vecchie impostare l'architettura appropriata (es. sm_75 per RTX 2070).
 
 #[cfg(not(feature = "cuda"))]
 fn main() {}
