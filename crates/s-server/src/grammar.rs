@@ -350,6 +350,67 @@ impl JsonState {
         true
     }
 
+    /// Suffisso di chiusura minima dallo stato corrente (vedi JsonMasker).
+    pub fn close_suffix(&self) -> String {
+        let mut out = String::new();
+        // true se abbiamo già completato un VALORE col suffisso (stringa
+        // chiusa, letterale finito, numero terminale): allora le fasi
+        // strutturali che ne derivano (CommaObj/Done/ecc.) NON vanno
+        // riempite con altro — restano solo le graffe parentesi da chiudere
+        let mut valore_completo = false;
+
+        // letterale parziale: completa con le lettere mancanti
+        let (word, pos) = self.lit;
+        if pos > 0 {
+            out.push_str(&word[pos..]);
+            valore_completo = true;
+        }
+        // numero: gli stati Dot/E/ESign vogliono una cifra; gli altri sono
+        // numeri già terminabili
+        match self.num {
+            Some(NumSt::Dot) | Some(NumSt::E) | Some(NumSt::ESign) => out.push('0'),
+            Some(_) => valore_completo = true,
+            None => {}
+        }
+        // stringa aperta: chiudila (un escape pendente consuma il primo
+        // backslash emesso, quindi serve anche la vera chiusura)
+        let mut era_chiave = false;
+        if self.in_str {
+            if self.esc {
+                out.push('\\');
+            }
+            out.push('"');
+            if self.is_key {
+                // chiusura di una CHIAVE: self.phase NON riflette la chiusura
+                // (close_suffix non muta) → sotto serve ':valore', gestito qui
+                era_chiave = true;
+            } else {
+                valore_completo = true;
+            }
+        }
+
+        if valore_completo {
+            // fase post-valore: niente da aggiungere, solo contenitori
+        } else if era_chiave {
+            out.push_str(":0");
+        } else {
+            match self.phase {
+                Phase::Key => out.push_str("\"_\":0"),
+                Phase::Colon => out.push_str(":0"),
+                Phase::CommaObj => out.push_str("\"_\":0"),
+                Phase::CommaArr => out.push('0'),
+                // radice vuota o posizione post-virgola: valore minimo
+                Phase::Value => out.push('0'),
+                Phase::Done => {}
+            }
+        }
+        // svuota i contenitori aperti
+        for c in self.stack.iter().rev() {
+            out.push(if c.obj { '}' } else { ']' });
+        }
+        out
+    }
+
     /// Primi char legali nello stato corrente — filtro rapido pre-vocabolario.
     pub fn first_chars(&self) -> &'static [char] {
         const STRUCT_ALL: &[char] =
@@ -417,6 +478,23 @@ impl JsonMasker {
             self.state.feed(text);
         }
     }
+
+    /// true se il valore radice è completo: qui i soli token speciali
+    /// (EOS ecc.) tornano ammessi dalla maschera.
+    pub fn is_done(&self) -> bool {
+        self.state.is_done()
+    }
+
+    /// Suffisso che CHIUSURE il JSON dallo stato corrente (auto-riparazione).
+    ///
+    /// Contratto AC-3 rafforzato dopo il test live su SmolLM2-135M: una
+    /// stringa mai chiusa è un prefisso sintatticamente LEGALE, quindi
+    /// max_tokens può tagliare a JSON incompleto. Con questo suffisso
+    /// l'output è valido SEMPRE: chiudi stringa/escape/letterale/numero,
+    /// completa "chiave:valore" pendenti e svuota la pila dei contenitori.
+    pub fn close_suffix(&self) -> String {
+        self.state.close_suffix()
+    }
 }
 
 #[cfg(test)]
@@ -472,6 +550,28 @@ mod tests {
             assert!(st.feed(piece), "pezzo rifiutato: {piece:?}");
         }
         assert!(st.is_done());
+    }
+
+    #[test]
+    fn close_suffix_ripara_tutti_i_prefissi_legali() {
+        // ogni prefisso legale + suffisso = JSON valido (contratto AC-3 forte)
+        let prefissi = [
+            "", "{", "{\"a\"", "{\"a\":", "{\"a\":1", "{\"a\":1,",
+            "{\"a\":[", "{\"a\":[1,", "{\"a\":\"test", "{\"a\":\"test\\\\",
+            "{\"a\":tru", "[", "[1,2,", "  {\"x\": [1.5e",
+        ];
+        for pfx in prefissi {
+            let mut st = JsonState::new();
+            assert!(st.feed(pfx), "prefisso base invalido: {pfx:?}");
+            let suffix = st.close_suffix();
+            let full = format!("{pfx}{suffix}");
+            // validiamo col NOSTRO automa: il totale deve essere feed-ok e Done
+            let mut check = JsonState::new();
+            assert!(
+                check.feed(&full) && check.is_done(),
+                "riparazione fallita per {pfx:?} → {full:?}"
+            );
+        }
     }
 
     #[test]

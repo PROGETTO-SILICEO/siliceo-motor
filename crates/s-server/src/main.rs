@@ -562,6 +562,10 @@ fn run_streaming_v(
     let mut on_tok = |t: u32| -> bool {
         if esiti.borrow().is_some() {
             esiti.borrow_mut().as_mut().unwrap().advance(t);
+            // AUTO-STOP sul JSON completo (AC-3)
+            if esiti.borrow().as_ref().unwrap().is_done() {
+                return on_token(t) && false;
+            }
         }
         on_token(t)
     };
@@ -577,7 +581,15 @@ fn run_streaming_v(
     // decode integrale degli id — altrimenti si emette ciò che la stop voleva
     // nascondere (bug trovato dal test live con stop=["capitale"]).
     let full = &out.text;
-    let coda = slicer.borrow_mut().finish(full);
+    let mut coda = slicer.borrow_mut().finish(full);
+    // AUTO-RIPARAZIONE in streaming: il suffisso va emesso come contenuto
+    if vincolo && !coda.is_empty() || vincolo && esiti.borrow().as_ref().map(|m| !m.is_done()).unwrap_or(false) {
+        if let Some(m) = esiti.borrow().as_ref() {
+            if !m.is_done() {
+                coda.push_str(&m.close_suffix());
+            }
+        }
+    }
     if !coda.is_empty() {
         let mut body = String::new();
         if is_chat {
@@ -637,7 +649,6 @@ fn run_generate_con_vincolo(
         inner.tok.eos_id().into_iter().chain(params.extra_eos.iter().copied()).collect();
     let decode = |g: &[u32]| inner.tok.decode(g).unwrap_or_default();
 
-    eprintln!("[ac3] vincolo json attivo: {vincolo}");
     if !vincolo {
         let mut nomask = || -> Option<Vec<bool>> { None };
         return s_models::generate::generate_tokens(
@@ -649,12 +660,24 @@ fn run_generate_con_vincolo(
     let m = std::cell::RefCell::new(grammar::JsonMasker::from_texts(texts));
     let mut on_tok = |t: u32| -> bool {
         m.borrow_mut().advance(t);
-        on_token(t)
+        // AUTO-STOP: valore radice completo → niente altro da generare.
+        // (bug beccato live: `done && on_token(t)` abortiva SEMPRE perché
+        // con done==false l'&& cortocircuitava senza chiamare on_token)
+        on_token(t) && !m.borrow().is_done()
     };
     let mut mk = || -> Option<Vec<bool>> { Some(m.borrow().mask()) };
-    s_models::generate::generate_tokens(
+    let mut out = s_models::generate::generate_tokens(
         &inner.model, ids, params, &eos_all, &decode, &mut on_tok, &mut mk,
-    )
+    );
+
+    // AUTO-RIPARAZIONE: se max_tokens taglia a JSON incompleto (prefisso
+    // comunque legale), il suffisso minimo dallo stato dell'automa lo rende
+    // valido SEMPRE. Nota: out.ids resta senza il suffisso testuale.
+    if !m.borrow().is_done() {
+        let suffix = m.borrow().close_suffix();
+        out.text.push_str(&suffix);
+    }
+    out
 }
 
 // ── motore ──

@@ -15,7 +15,22 @@ pub mod types;
 pub mod value;
 
 use std::fs::File;
-use std::io::{Read, Seek, SeekFrom};
+use std::io::{BufReader, Read, Seek, SeekFrom};
+
+/// Lettura primitiva della regione header/metadata. Implementata sia dal
+/// Cursor su buffer sia dallo streaming su file (BUG 26/08: open() leggeva
+/// l'INTERO file in RAM — su gemma4/qwen35 = gigabyte e timeout che
+/// sembravano loop infiniti; con `head |` il processo moriva a metà e
+/// sembrava "finito". Lezione: mai fidarsi di un exit code filtrato da pipe).
+pub(crate) trait ReadBytes {
+    fn rb_u8(&mut self) -> Result<u8>;
+    fn rb_u16(&mut self) -> Result<u16>;
+    fn rb_u32(&mut self) -> Result<u32>;
+    fn rb_u64(&mut self) -> Result<u64>;
+    fn rb_string(&mut self) -> Result<String>;
+    /// Posizione corrente (byte dall'inizio del flusso).
+    fn rb_pos(&mut self) -> Result<u64>;
+}
 use std::path::Path;
 
 pub use types::GgmlType;
@@ -93,32 +108,31 @@ pub struct GgufFile {
 
 impl GgufFile {
     /// Apre un file GGUF: legge header, metadata e tensor info. I pesi restano su disco.
+    /// Apre il file leggendo SOLO header+metadata+indice tensori (streaming):
+    /// i dati dei tensori restano sul disco e vengono letti con seek alla
+    /// domanda (tensor_data_*). RAM del load: kilobyte, non gigabyte.
     pub fn open(path: impl AsRef<Path>) -> Result<Self> {
-        let mut file = File::open(path)?;
-        let mut buf = Vec::new();
-        // Legge l'intero "header region": per file grandi non conosciamo a priori
-        // la dimensione, quindi leggiamo in modo incrementale con un cursore.
-        file.read_to_end(&mut buf)?;
-        let mut c = Cursor::new(&buf);
+        let file = File::open(path)?;
+        let mut c = StreamReader::new(BufReader::with_capacity(1 << 20, file));
 
         // Header
-        let magic = c.read_u32()?;
+        let magic = c.rb_u32()?;
         if magic != 0x4655_4747 {
             return Err(GgufError::BadMagic);
         }
-        let version = c.read_u32()?;
+        let version = c.rb_u32()?;
         if version != 3 && version != 2 {
             return Err(GgufError::UnsupportedVersion(version));
         }
-        let tensor_count = c.read_u64()?;
-        let kv_count = c.read_u64()?;
+        let tensor_count = c.rb_u64()?;
+        let kv_count = c.rb_u64()?;
 
         // Metadata (tutti materializzati)
         let mut metadata = Vec::with_capacity(kv_count.min(1024) as usize);
         let mut alignment: u64 = 32; // default GGUF
         for _ in 0..kv_count {
-            let key = c.read_string()?;
-            let vt = c.read_u32()?;
+            let key = c.rb_string()?;
+            let vt = c.rb_u32()?;
             let val = GgufValue::read(&mut c, vt)?;
             // general.alignment sovrascrive l'allineamento (spec GGUF)
             if key == "general.alignment" {
@@ -132,8 +146,8 @@ impl GgufFile {
         // Tensor info
         let mut tensors = Vec::with_capacity(tensor_count.min(4096) as usize);
         for _ in 0..tensor_count {
-            let name = c.read_string()?;
-            let n_dims = c.read_u32()? as usize;
+            let name = c.rb_string()?;
+            let n_dims = c.rb_u32()? as usize;
             if n_dims == 0 || n_dims > 8 {
                 return Err(GgufError::BadTensor(format!(
                     "{name}: n_dims={n_dims} fuori range"
@@ -141,23 +155,26 @@ impl GgufFile {
             }
             let mut dims = Vec::with_capacity(n_dims);
             for _ in 0..n_dims {
-                dims.push(c.read_u64()?);
+                dims.push(c.rb_u64()?);
             }
-            let ty_raw = c.read_u32()?;
+            let ty_raw = c.rb_u32()?;
             let ggml_type = GgmlType::from_raw(ty_raw)
                 .ok_or(GgufError::BadType(ty_raw))?;
-            let offset = c.read_u64()?;
+            let offset = c.rb_u64()?;
             tensors.push(TensorInfo { name, n_dims: n_dims as u32, dims, ggml_type, offset });
         }
 
         // Sezione dati: allineata all'inizio del padding
-        let header_end = c.pos() as u64;
+        let header_end = c.rb_pos()?;
         let data_start = if tensor_count > 0 {
             header_end.div_ceil(alignment) * alignment
         } else {
             header_end
         };
 
+        // il File è dentro StreamReader dentro BufReader: recuperato per i seek dati
+        let mut file = c.into_inner().into_inner();
+        let _ = &mut file;
         Ok(Self { file, header: GgufHeader { version, tensor_count, kv_count }, metadata, tensors, data_start, alignment })
     }
 
@@ -195,47 +212,55 @@ impl GgufFile {
     }
 }
 
-/// Cursore di lettura su buffer (per la regione header/metadata).
-pub(crate) struct Cursor<'a> {
-    buf: &'a [u8],
-    pos: usize,
+/// Lettore in STREAMING sulla regione header: non materializza il file.
+pub(crate) struct StreamReader<R: Read> {
+    inner: R,
+    pos: u64,
 }
 
-impl<'a> Cursor<'a> {
-    fn new(buf: &'a [u8]) -> Self {
-        Self { buf, pos: 0 }
+impl<R: Read> StreamReader<R> {
+    fn new(inner: R) -> Self {
+        Self { inner, pos: 0 }
     }
-    fn pos(&self) -> usize {
-        self.pos
+    /// Recupera il reader interno (per i seek dati dopo l'header).
+    fn into_inner(self) -> R {
+        self.inner
     }
-    fn take(&mut self, n: usize) -> Result<&'a [u8]> {
-        if self.pos + n > self.buf.len() {
-            return Err(GgufError::Truncated { expected: n, found: self.buf.len() - self.pos });
-        }
-        let s = &self.buf[self.pos..self.pos + n];
-        self.pos += n;
-        Ok(s)
-    }
-    fn read_u8(&mut self) -> Result<u8> {
-        let b = self.take(1)?;
+}
+
+impl<R: Read> ReadBytes for StreamReader<R> {
+    fn rb_u8(&mut self) -> Result<u8> {
+        let mut b = [0u8; 1];
+        self.inner.read_exact(&mut b)?;
+        self.pos += 1;
         Ok(b[0])
     }
-    fn read_u16(&mut self) -> Result<u16> {
-        let b = self.take(2)?;
-        Ok(u16::from_le_bytes([b[0], b[1]]))
+    fn rb_u16(&mut self) -> Result<u16> {
+        let mut b = [0u8; 2];
+        self.inner.read_exact(&mut b)?;
+        self.pos += 2;
+        Ok(u16::from_le_bytes(b))
     }
-    fn read_u32(&mut self) -> Result<u32> {
-        let b = self.take(4)?;
-        Ok(u32::from_le_bytes([b[0], b[1], b[2], b[3]]))
+    fn rb_u32(&mut self) -> Result<u32> {
+        let mut b = [0u8; 4];
+        self.inner.read_exact(&mut b)?;
+        self.pos += 4;
+        Ok(u32::from_le_bytes(b))
     }
-    fn read_u64(&mut self) -> Result<u64> {
-        let b = self.take(8)?;
-        Ok(u64::from_le_bytes(b.try_into().unwrap()))
+    fn rb_u64(&mut self) -> Result<u64> {
+        let mut b = [0u8; 8];
+        self.inner.read_exact(&mut b)?;
+        self.pos += 8;
+        Ok(u64::from_le_bytes(b))
     }
-    fn read_string(&mut self) -> Result<String> {
-        let len = self.read_u64()? as usize;
-        let bytes = self.take(len)?;
-        String::from_utf8(bytes.to_vec())
-            .map_err(|_| GgufError::BadTensor("stringa non utf8".into()))
+    fn rb_string(&mut self) -> Result<String> {
+        let len = self.rb_u64()? as usize;
+        let mut bytes = vec![0u8; len];
+        self.inner.read_exact(&mut bytes)?;
+        self.pos += len as u64;
+        String::from_utf8(bytes).map_err(|_| GgufError::BadTensor("stringa non utf8".into()))
+    }
+    fn rb_pos(&mut self) -> Result<u64> {
+        Ok(self.pos)
     }
 }

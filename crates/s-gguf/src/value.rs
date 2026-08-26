@@ -4,7 +4,7 @@
 //! 0=u8, 1=i8, 2=u16, 3=i16, 4=u32, 5=i32, 6=f32, 7=bool, 8=string,
 //! 9=array, 10=u64, 11=i64, 12=f64
 
-use super::{Cursor, GgufError, Result};
+use super::{GgufError, ReadBytes, Result};
 
 /// Valore di metadata GGUF.
 #[derive(Debug, Clone, PartialEq)]
@@ -25,21 +25,20 @@ pub enum GgufValue {
 }
 
 impl GgufValue {
-    /// Legge un valore del tipo `vt` dal cursore. (Interno: `Cursor` è pub(crate).)
-    pub(crate) fn read(c: &mut Cursor, vt: u32) -> Result<Self> {
+    pub(crate) fn read<R: ReadBytes>(c: &mut R, vt: u32) -> Result<Self> {
         Ok(match vt {
-            0 => Self::U8(c.read_u8()?),
-            1 => Self::I8(c.read_u8()? as i8),
-            2 => Self::U16(c.read_u16()?),
-            3 => Self::I16(c.read_u16()? as i16),
-            4 => Self::U32(c.read_u32()?),
-            5 => Self::I32(c.read_u32()? as i32),
-            6 => Self::F32(f32::from_bits(c.read_u32()?)),
-            7 => Self::Bool(c.read_u8()? != 0),
-            8 => Self::String(c.read_string()?),
+            0 => Self::U8(c.rb_u8()?),
+            1 => Self::I8(c.rb_u8()? as i8),
+            2 => Self::U16(c.rb_u16()?),
+            3 => Self::I16(c.rb_u16()? as i16),
+            4 => Self::U32(c.rb_u32()?),
+            5 => Self::I32(c.rb_u32()? as i32),
+            6 => Self::F32(f32::from_bits(c.rb_u32()?)),
+            7 => Self::Bool(c.rb_u8()? != 0),
+            8 => Self::String(c.rb_string()?),
             9 => {
-                let elem_type = c.read_u32()?;
-                let n = c.read_u64()?;
+                let elem_type = c.rb_u32()?;
+                let n = c.rb_u64()?;
                 // Protezione: array enormi di tipi piccoli sono legittimi
                 // (es. tokenizer vocabolario), ma un count assurdo indica corruzione.
                 if n > 100_000_000 {
@@ -51,9 +50,9 @@ impl GgufValue {
                 }
                 Self::Array(v)
             }
-            10 => Self::U64(c.read_u64()?),
-            11 => Self::I64(c.read_u64()? as i64),
-            12 => Self::F64(f64::from_bits(c.read_u64()?)),
+            10 => Self::U64(c.rb_u64()?),
+            11 => Self::I64(c.rb_u64()? as i64),
+            12 => Self::F64(f64::from_bits(c.rb_u64()?)),
             other => return Err(GgufError::BadType(other)),
         })
     }
