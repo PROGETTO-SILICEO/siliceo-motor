@@ -44,16 +44,6 @@ impl PrefixCache {
 
     /// Lo snapshot col prefisso comune più lungo, pronto per il seme:
     /// - chiave = prefisso esatto dei token richiesti (confronto al byte);
-    /// - capacità ≥ posizioni richieste (prompt + generazione);
-    /// - troncato a `min(len, ids.len()-1)` come vuole il contratto di
-    ///   `generate_tokens_seeded` (serve almeno un token da ricalcolare,
-    ///   per avere i logits dell'ultimo).
-    ///
-    /// Stati NON troncabili (ibridi con layer ricorrenti, da F5 in poi)
-    /// non vengono mai seminati: conservativi finché F5 non porta il
-    /// riuso esatto-senza-truncation.
-    /// Lo snapshot col prefisso comune più lungo, pronto per il seme:
-    /// - chiave = prefisso esatto dei token richiesti (confronto al byte);
     /// - troncato a `min(len, ids.len()-1)` come vuole il contratto di
     ///   `generate_tokens_seeded` (serve almeno un token da ricalcolare,
     ///   per avere i logits dell'ultimo);
@@ -62,9 +52,10 @@ impl PrefixCache {
     ///   corto (scoperto dal test live). Crescere preserva i dati scritti e
     ///   azzera solo la zona che il forward non legge mai.
     ///
-    /// Stati NON troncabili (ibridi con layer ricorrenti, da F5 in poi)
-    /// non vengono mai seminati: conservativi finché F5 non porta il
-    /// riuso esatto-senza-truncation.
+    /// Stati ibridi (con layer ricorrenti, da F5/F6): riuso SOLO per estensione
+    /// (n==len, nessun truncate). Il troncare a n<len è rifiutato perché lo
+    /// stato ricorrente non è posizionale — per la query identica si rifa
+    /// prefill pieno (un token in più costa meno di un secondo percorso).
     pub fn find(&mut self, ids: &[u32], capacita_richiesta: usize) -> Option<(SeqState, usize)> {
         let mut migliore: Option<usize> = None;
         for (i, v) in self.voci.iter().enumerate() {
@@ -210,11 +201,16 @@ mod tests {
             LayerSeq::Kv(LayerKv::new(4, 64)),
             LayerSeq::Recurrent(s_models::state::RecurrentState::zeroed([1, 4, 4])),
         ]);
-        misto.advance(5);
+        misto.advance(8);
         let chiave: Vec<u32> = (0..8).collect();
         c.store(chiave.clone(), misto);
-        // lo stato ricorrente non può tornare indietro → nessun seme (F5 deciderà il riuso esatto)
-        let query: Vec<u32> = (0..12).collect();
-        assert!(c.find(&query, 14).is_none());
+        // F6: estensione del prefisso (n==len) OK anche per ibridi; truncamento (n<len) rifiutato
+        let query_estesa: Vec<u32> = (0..12).collect();
+        let (st, n) = c.find(&query_estesa, 14).expect("estensione ibrida deve riuscire (n==len)");
+        assert_eq!(n, 8);
+        assert_eq!(st.len, 8);
+        // richiesta IDENTICA → n=len-1=7 → truncate rifiutato → nessun seme
+        let query_identica: Vec<u32> = (0..8).collect();
+        assert!(c.find(&query_identica, 14).is_none());
     }
 }

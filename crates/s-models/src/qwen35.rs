@@ -8,6 +8,7 @@
 //! Verifica F5: parity dei logits con llama.cpp sullo stesso prompt.
 
 use crate::registry::Famiglia;
+use crate::state::{LayerKv, LayerSeq, RecurrentState, SeqState};
 use s_gguf::GgufFile;
 
 #[derive(Debug, Clone)]
@@ -292,6 +293,88 @@ impl Model {
         }
 
         // Final norm + output head
+        let mut last_raw = vec![0.0f32; ne];
+        last_raw.copy_from_slice(&x[(seq - 1) * ne..seq * ne]);
+        let mut last_normed = vec![0.0f32; ne];
+        rmsnorm_row(&last_raw, &self.output_norm, c.rms_eps, &mut last_normed);
+        logits_from_hidden(&self.output, ne, &last_normed)
+    }
+
+    /// Crea uno SeqState dimensionato per `max_seq` posizioni.
+    /// Layer ricorrenti → RecurrentState delta_net (S + conv_buf), layer attention → Kv.
+    pub fn new_cache(&self, max_seq: usize) -> SeqState {
+        let c = &self.config;
+        let key_dim = c.ssm_d_state * c.ssm_n_group;
+        let value_dim = c.ssm_d_state * c.ssm_dt_rank;
+        let conv_dim = key_dim * 2 + value_dim;
+        let kv_dim = c.n_kv_heads * c.head_dim;
+        let mut layers = Vec::with_capacity(c.n_layers);
+        for i in 0..c.n_layers {
+            if c.is_recurrent(i) {
+                let shape = [c.ssm_dt_rank, c.ssm_d_state, c.ssm_d_state];
+                layers.push(LayerSeq::Recurrent(RecurrentState::delta_net(
+                    shape, conv_dim, c.ssm_d_conv,
+                )));
+            } else {
+                layers.push(LayerSeq::Kv(LayerKv::new(kv_dim, max_seq)));
+            }
+        }
+        SeqState::from_layers(layers)
+    }
+
+    /// Forward cached: prefill (seq>1) o decode (seq==1) con stato persistente.
+    /// Invariante: `forward(tokens) == new_cache + forward_cached(tokens)`.
+    pub fn forward_cached(&self, tokens: &[u32], cache: &mut SeqState) -> Vec<f32> {
+        assert_eq!(
+            cache.n_layers(),
+            self.config.n_layers,
+            "cache n_layers {} != config {}",
+            cache.n_layers(),
+            self.config.n_layers
+        );
+        let c = &self.config;
+        let seq = tokens.len();
+        assert!(seq > 0, "forward_cached: tokens vuoto");
+        let pos0 = cache.len;
+        let ne = c.n_embd;
+
+        // embedding lookup solo sui nuovi token
+        let mut x = vec![0.0f32; seq * ne];
+        for (s, &t) in tokens.iter().enumerate() {
+            let off = t as usize * ne;
+            x[s * ne..(s + 1) * ne].copy_from_slice(&self.tok_embd[off..off + ne]);
+        }
+
+        let mut tmp_ffn1 = vec![0.0f32; c.n_ff];
+        let mut tmp_ffn2 = vec![0.0f32; c.n_ff.max(ne)];
+
+        for (li, layer) in self.layers.iter().enumerate() {
+            if c.is_recurrent(li) {
+                // DeltaNet: usa S + conv_buf persistenti
+                let rec = cache.layer_recurrent_mut(li);
+                let (state, conv_buf) = rec.parts_mut();
+                // forward_delta_net_layer si aspetta seq e x mut
+                self.forward_delta_net_layer(
+                    li, seq, &mut x,
+                    match layer {
+                        LayerWeights::DeltaNet(dn) => dn,
+                        _ => panic!("layer {li} atteso DeltaNet"),
+                    },
+                    c, conv_buf, state, &mut tmp_ffn1, &mut tmp_ffn2,
+                );
+            } else {
+                let at = match layer {
+                    LayerWeights::Attention(a) => a,
+                    _ => panic!("layer {li} atteso Attention"),
+                };
+                self.forward_attention_layer_cached(
+                    li, seq, pos0, &mut x, at, c, cache, &mut tmp_ffn1, &mut tmp_ffn2,
+                );
+            }
+        }
+
+        cache.advance(seq);
+
         let mut last_raw = vec![0.0f32; ne];
         last_raw.copy_from_slice(&x[(seq - 1) * ne..seq * ne]);
         let mut last_normed = vec![0.0f32; ne];
@@ -742,6 +825,141 @@ impl Model {
             }
         }
     }
+
+    /// Attention cached — F6: stesso calcolo di `forward_attention_layer` ma incrementale.
+    /// `pos0 = cache.len` prima della scrittura; scrive K/V rope'd in cache e le rilegge per attention.
+    fn forward_attention_layer_cached(
+        &self,
+        li: usize,
+        seq: usize,
+        pos0: usize,
+        x: &mut [f32],
+        at: &AttentionWeights,
+        c: &Config,
+        cache: &mut SeqState,
+        tmp1: &mut [f32],
+        tmp2: &mut [f32],
+    ) {
+        let ne = c.n_embd;
+        let hd = c.head_dim;
+        let n_heads = c.n_heads;
+        let n_kv_heads = c.n_kv_heads;
+        let q_dim = n_heads * hd;
+        let q_full_dim = q_dim * 2;
+        let kv_dim = n_kv_heads * hd;
+        let n_rot = c.rope_n_rot;
+
+        let mut normed = vec![0.0f32; seq * ne];
+        let mut q_all = vec![0.0f32; seq * q_dim];
+        let mut gate_all = vec![0.0f32; seq * q_dim];
+        let mut k_new = vec![0.0f32; seq * kv_dim];
+        let mut v_new = vec![0.0f32; seq * kv_dim];
+        let mut attn_out = vec![0.0f32; seq * q_dim];
+
+        for s in 0..seq {
+            let x_s = &x[s * ne..(s + 1) * ne];
+            rmsnorm_row(x_s, &at.attn_norm, c.rms_eps, &mut normed[s * ne..(s + 1) * ne]);
+            let x_normed = &normed[s * ne..(s + 1) * ne];
+
+            let mut q_full = vec![0.0f32; q_full_dim];
+            matmul_row_vec(&at.wq, ne, q_full_dim, x_normed, &mut q_full);
+            let q_off = s * q_dim;
+            let g_off = s * q_dim;
+            let kv_off = s * kv_dim;
+            for h in 0..n_heads {
+                let src = h * 512;
+                let dst = h * hd;
+                q_all[q_off + dst..q_off + dst + hd].copy_from_slice(&q_full[src..src + hd]);
+                gate_all[g_off + dst..g_off + dst + hd].copy_from_slice(&q_full[src + hd..src + 2 * hd]);
+            }
+            for h in 0..n_heads {
+                let h_off = q_off + h * hd;
+                let mut tmp = vec![0.0f32; hd];
+                rmsnorm_row(&q_all[h_off..h_off + hd], &at.q_norm, c.rms_eps, &mut tmp);
+                q_all[h_off..h_off + hd].copy_from_slice(&tmp);
+            }
+            matmul_row_vec(&at.wk, ne, kv_dim, x_normed, &mut k_new[kv_off..kv_off + kv_dim]);
+            matmul_row_vec(&at.wv, ne, kv_dim, x_normed, &mut v_new[kv_off..kv_off + kv_dim]);
+            for h in 0..n_kv_heads {
+                let h_off = kv_off + h * hd;
+                let mut tmp = vec![0.0f32; hd];
+                rmsnorm_row(&k_new[h_off..h_off + hd], &at.k_norm, c.rms_eps, &mut tmp);
+                k_new[h_off..h_off + hd].copy_from_slice(&tmp);
+            }
+            rope_mrope(&mut q_all[q_off..q_off + q_dim], n_heads, hd, c.rope_theta, pos0 + s, n_rot);
+            rope_mrope(&mut k_new[kv_off..kv_off + kv_dim], n_kv_heads, hd, c.rope_theta, pos0 + s, n_rot);
+        }
+
+        // scrivi K/V nuovi in cache (layer_k_mut già offsettato a pos0)
+        cache.layer_k_mut(li)[..seq * kv_dim].copy_from_slice(&k_new);
+        cache.layer_v_mut(li)[..seq * kv_dim].copy_from_slice(&v_new);
+
+        let total = pos0 + seq;
+        // attenzione: k_all/v_all per il prefisso sono in cache, non più in k_new
+        let k_cache = cache.layer_k_upto(li, total);
+        let v_cache = cache.layer_v_upto(li, total);
+        let heads_per_kv = n_heads / n_kv_heads;
+        let scale = 1.0 / (hd as f32).sqrt();
+        for s in 0..seq {
+            for h in 0..n_heads {
+                let kvh = h / heads_per_kv;
+                let abs_s = pos0 + s;
+                let mut scores = vec![0.0f32; abs_s + 1];
+                for t in 0..=abs_s {
+                    let qh = &q_all[s * q_dim + h * hd..s * q_dim + (h + 1) * hd];
+                    let kh = &k_cache[t * kv_dim + kvh * hd..t * kv_dim + (kvh + 1) * hd];
+                    let mut dot = 0.0f32;
+                    for d in 0..hd {
+                        dot += qh[d] * kh[d];
+                    }
+                    scores[t] = dot * scale;
+                }
+                softmax_row_f32(&mut scores);
+                let o_off = s * q_dim + h * hd;
+                for d in 0..hd {
+                    attn_out[o_off + d] = 0.0;
+                }
+                for t in 0..=abs_s {
+                    let w = scores[t];
+                    let vh = &v_cache[t * kv_dim + kvh * hd..t * kv_dim + (kvh + 1) * hd];
+                    for d in 0..hd {
+                        attn_out[o_off + d] += w * vh[d];
+                    }
+                }
+            }
+        }
+
+        for s in 0..seq {
+            let base = s * q_dim;
+            for i in 0..q_dim {
+                attn_out[base + i] *= sigmoid(gate_all[base + i]);
+            }
+        }
+        for s in 0..seq {
+            let mut proj = vec![0.0f32; ne];
+            matmul_row_vec(&at.wo, q_dim, ne, &attn_out[s * q_dim..(s + 1) * q_dim], &mut proj);
+            for i in 0..ne {
+                x[s * ne + i] += proj[i];
+            }
+        }
+        for s in 0..seq {
+            let x_s = x[s * ne..(s + 1) * ne].to_vec();
+            let mut post_normed = vec![0.0f32; ne];
+            rmsnorm_row(&x_s, &at.post_norm, c.rms_eps, &mut post_normed);
+            let gate = &mut tmp1[..c.n_ff];
+            matmul_row_vec(&at.ffn_gate, ne, c.n_ff, &post_normed, gate);
+            let up = &mut tmp2[..c.n_ff];
+            matmul_row_vec(&at.ffn_up, ne, c.n_ff, &post_normed, up);
+            for i in 0..c.n_ff {
+                gate[i] = silu(gate[i]) * up[i];
+            }
+            let down = &mut tmp2[..ne];
+            matmul_row_vec(&at.ffn_down, c.n_ff, ne, gate, down);
+            for i in 0..ne {
+                x[s * ne + i] += down[i];
+            }
+        }
+    }
     /// Debug: esegue un singolo layer attention (indice li) su hidden isolato (seq=1) per parity vs HF.
     pub fn debug_single_layer(&self, layer_idx: usize, hidden_in: &[f32]) -> Vec<f32> {
         let c = &self.config;
@@ -771,6 +989,24 @@ impl Model {
             }
         }
         x_seq
+    }
+}
+
+// ── Device impl — F6: Qwen35 come backend per generate.rs / s-server ──
+impl crate::device::Device for Model {
+    type Cache = SeqState;
+    type Config = Config;
+
+    fn config(&self) -> &Config {
+        &self.config
+    }
+
+    fn new_cache(&self, max_seq: usize) -> SeqState {
+        self.new_cache(max_seq)
+    }
+
+    fn forward_cached(&self, tokens: &[u32], cache: &mut SeqState) -> Vec<f32> {
+        self.forward_cached(tokens, cache)
     }
 }
 
@@ -936,5 +1172,83 @@ mod tests {
         assert_eq!(logits.len(), model.config.vocab_size,
             "vocab_size atteso {}", model.config.vocab_size);
         eprintln!("forward ok: logits[0..5] = {:?}", &logits[..5.min(logits.len())]);
+    }
+
+    #[test]
+    fn cache_parity_vs_full_recompute() {
+        let path = "/tmp/opencode/Qwen3.5-0.8B-F16.gguf";
+        let path_q4 = "/tmp/opencode/Qwen3.5-0.8B-Q4_0.gguf";
+        let path = if std::path::Path::new(path).exists() { path } else { path_q4 };
+        if !std::path::Path::new(path).exists() {
+            eprintln!("skip: {path} non trovato");
+            return;
+        }
+        let model = Model::load(path).expect("load");
+        // prompt di test: Hello [9419] + 3 token extra
+        let prompt_full = vec![9419u32, 11, 4858, 0];
+        // golden full-recompute
+        let logits_full = model.forward(&prompt_full);
+        // cached: prefill 2 + decode 1 + decode 1
+        let mut cache = model.new_cache(64);
+        let l1 = model.forward_cached(&prompt_full[..2], &mut cache);
+        let _ = l1; // logits di [9419,11] non confrontati (prefill intermedio)
+        let l2 = model.forward_cached(&prompt_full[2..3], &mut cache);
+        let logits_cached_step = model.forward_cached(&prompt_full[3..4], &mut cache);
+        // ora confronta cached step finale vs full
+        let maxdiff = logits_full.iter().zip(logits_cached_step.iter())
+            .map(|(a,b)| (a-b).abs()).fold(0.0f32, f32::max);
+        let mean = logits_full.iter().zip(logits_cached_step.iter())
+            .map(|(a,b)| (a-b).abs()).sum::<f32>() / logits_full.len() as f32;
+        eprintln!("cache parity: maxdiff {maxdiff:e} mean {mean:e}");
+        assert!(maxdiff < 1e-4, "maxdiff {maxdiff} troppo alto (atteso <1e-4)");
+        // anche prefill unico vs full deve coincidere
+        let mut cache2 = model.new_cache(64);
+        let logits_prefill = model.forward_cached(&prompt_full, &mut cache2);
+        let maxdiff2 = logits_full.iter().zip(logits_prefill.iter())
+            .map(|(a,b)| (a-b).abs()).fold(0.0f32, f32::max);
+        eprintln!("prefill parity: maxdiff {maxdiff2:e}");
+        assert!(maxdiff2 < 1e-4, "prefill maxdiff {maxdiff2}");
+
+        // prefill lungo (8 token) vs decode 1+1
+        let long = vec![9419u32, 11, 4858, 0, 13, 1017, 13, 16];
+        let full_long = model.forward(&long);
+        let mut c3 = model.new_cache(64);
+        let _ = model.forward_cached(&long[..4], &mut c3);
+        let cached_long = model.forward_cached(&long[4..], &mut c3);
+        // attenzione: forward_cached(&long[4..]) con seq=4 non è decode 1-per-1 ma chunk
+        // confronto: dovrebbe coincidere con full su stesso prefisso totale
+        let mut c4 = model.new_cache(64);
+        let full_cached_long = model.forward_cached(&long, &mut c4);
+        let md = full_long.iter().zip(full_cached_long.iter()).map(|(a,b)|(a-b).abs()).fold(0.0f32, f32::max);
+        eprintln!("long prefill chunk maxdiff {md:e} cached_chunk vs full_cached { }", {
+            let d = cached_long.iter().zip(full_cached_long.iter()).map(|(a,b)|(a-b).abs()).fold(0.0f32, f32::max);
+            d
+        });
+        assert!(md < 1e-4);
+    }
+
+    #[test]
+    fn generate_via_device_parity() {
+        let path = "/tmp/opencode/Qwen3.5-0.8B-F16.gguf";
+        if !std::path::Path::new(path).exists() { eprintln!("skip"); return; }
+        let model = Model::load(path).unwrap();
+        let prompt = vec![9419u32, 11, 4858];
+        // manual loop 6 token
+        let mut cache = model.new_cache(64);
+        let mut logits = model.forward_cached(&prompt, &mut cache);
+        let mut manual = Vec::new();
+        for _ in 0..6 {
+            let next = logits.iter().enumerate().max_by(|a,b| a.1.partial_cmp(b.1).unwrap()).unwrap().0 as u32;
+            manual.push(next);
+            logits = model.forward_cached(&[next], &mut cache);
+        }
+        // via generate trait
+        use crate::generate::{GenerateParams, generate_tokens};
+        use crate::device::Device as _;
+        let params = GenerateParams { max_tokens: 6, temperature: 0.0, ..Default::default() };
+        let eos: Vec<u32> = vec![];
+        let out = generate_tokens(&model, &prompt, &params, &eos, &|ids| ids.iter().map(|x| x.to_string()).collect::<Vec<_>>().join(","), &mut |_| true, &mut || None);
+        assert_eq!(out.ids, manual, "generate via Device diverge da manual cached loop");
+        eprintln!("generate parity 6 tok: {:?}", out.ids);
     }
 }

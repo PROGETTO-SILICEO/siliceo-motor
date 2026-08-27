@@ -38,12 +38,18 @@ pub struct LayerKv {
 }
 
 /// Stato ricorrente: buffer piatto + shape logica.
+/// F6: per DeltaNet il buffer contiene DUE regioni contigue:
+/// `[ S (d_state×d_state×n_v_heads) | conv_buf (conv_k×conv_dim) ]`
+/// così Clone / reset / prefix-cache clonano TUTTO lo stato del layer in un colpo.
 #[derive(Clone)]
 pub struct RecurrentState {
     data: Vec<f32>,
     /// shape logica (es. `[n_heads, d_state, d_head]`). Solo documentale finché
     /// F5 non fissa il layout operativo.
     shape: [usize; 3],
+    /// dimensione conv per DeltaNet (0 = stato puro senza convoluzione).
+    conv_dim: usize,
+    conv_k: usize,
 }
 
 /// Stato multi-layer di una sequenza in elaborazione.
@@ -117,7 +123,15 @@ impl RecurrentState {
     /// Stato azzerato con shape logica `[d0, d1, d2]`.
     pub fn zeroed(shape: [usize; 3]) -> Self {
         let n = shape[0] * shape[1] * shape[2];
-        Self { data: vec![0.0; n], shape }
+        Self { data: vec![0.0; n], shape, conv_dim: 0, conv_k: 0 }
+    }
+
+    /// Stato DeltaNet: S [n_heads×d_state×d_state] + conv_buf [conv_k×conv_dim].
+    /// shape = [n_v_heads, d_state, d_state] per S; conv_dim = key_dim*2+value_dim, conv_k=4.
+    pub fn delta_net(shape: [usize; 3], conv_dim: usize, conv_k: usize) -> Self {
+        let n_s = shape[0] * shape[1] * shape[2];
+        let n_conv = conv_dim * conv_k;
+        Self { data: vec![0.0; n_s + n_conv], shape, conv_dim, conv_k }
     }
 
     pub fn shape(&self) -> [usize; 3] {
@@ -125,11 +139,63 @@ impl RecurrentState {
     }
 
     /// Buffer piatto dello stato (lettura/scrittura diretta dal forward).
+    /// Per DeltaNet questo è SOLO la regione S (compatibile col codice F5).
+    /// Usare `conv_buf_mut()` per la convoluzione.
     pub fn data_mut(&mut self) -> &mut [f32] {
-        &mut self.data
+        let n_s = self.shape[0] * self.shape[1] * self.shape[2];
+        &mut self.data[..n_s]
     }
     pub fn data(&self) -> &[f32] {
+        let n_s = self.shape[0] * self.shape[1] * self.shape[2];
+        &self.data[..n_s]
+    }
+
+    /// Buffer piatto completo (S + conv). Usato da `reset()` e Clone.
+    pub(crate) fn full_data(&self) -> &[f32] {
         &self.data
+    }
+    pub(crate) fn full_data_mut(&mut self) -> &mut [f32] {
+        &mut self.data
+    }
+
+    /// Conv buffer: regione dopo S, size `conv_k * conv_dim`.
+    /// Ritorna slice vuota se `conv_dim==0` (stato puro non-DeltaNet).
+    pub(crate) fn conv_buf(&self) -> &[f32] {
+        if self.conv_dim == 0 {
+            return &[];
+        }
+        let n_s = self.shape[0] * self.shape[1] * self.shape[2];
+        &self.data[n_s..]
+    }
+    pub(crate) fn conv_buf_mut(&mut self) -> &mut [f32] {
+        if self.conv_dim == 0 {
+            return &mut [];
+        }
+        let n_s = self.shape[0] * self.shape[1] * self.shape[2];
+        &mut self.data[n_s..]
+    }
+
+    /// Accesso diretto a S come mut (alias di data_mut, esplicito per F6).
+    pub(crate) fn s_mut(&mut self) -> &mut [f32] {
+        self.data_mut()
+    }
+    pub(crate) fn s(&self) -> &[f32] {
+        self.data()
+    }
+
+    pub fn conv_dim(&self) -> usize { self.conv_dim }
+    pub fn conv_k(&self) -> usize { self.conv_k }
+
+    /// Entrambe le regioni mut in UN colpo (evita doppio borrow).
+    pub(crate) fn parts_mut(&mut self) -> (&mut [f32], &mut [f32]) {
+        let n_s = self.shape[0] * self.shape[1] * self.shape[2];
+        let (s, c) = self.data.split_at_mut(n_s);
+        (s, c)
+    }
+    pub(crate) fn parts(&self) -> (&[f32], &[f32]) {
+        let n_s = self.shape[0] * self.shape[1] * self.shape[2];
+        let (s, c) = self.data.split_at(n_s);
+        (s, c)
     }
 }
 
@@ -279,6 +345,9 @@ impl SeqState {
                 self.len
             ));
         }
+        if len == self.len {
+            return Ok(());
+        }
         if self.layers.iter().any(|l| matches!(l, LayerSeq::Recurrent(_))) {
             return Err(
                 "truncate: lo stato ha layer ricorrenti, che non possono tornare \
@@ -406,6 +475,18 @@ mod tests {
         let err = st.truncate(2).unwrap_err();
         assert!(err.contains("ricorrenti"), "messaggio fuorviante: {err}");
         // lo stato resta INTATTO dopo il rifiuto
+        assert_eq!(st.len, 5);
+    }
+
+    #[test]
+    fn truncate_ricorrente_identita_ok_per_prefix_cache_f6() {
+        let mut st = SeqState::from_layers(vec![
+            LayerSeq::Kv(LayerKv::new(4, 8)),
+            LayerSeq::Recurrent(RecurrentState::zeroed([1, 4, 4])),
+        ]);
+        st.advance(5);
+        // n==len è no-op, deve riuscire anche per ibridi (permetta riuso esatto)
+        st.truncate(5).unwrap();
         assert_eq!(st.len, 5);
     }
 

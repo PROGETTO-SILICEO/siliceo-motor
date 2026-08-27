@@ -70,11 +70,23 @@ Dettagli in [docs/AGENTIC_CORE.md](docs/AGENTIC_CORE.md).
 - Benchmark suite anti-cheat come regression gate
 - **Target**: ≥80% di llama.cpp su dense 8B Q4
 
-## 🔜 F5 — Architetture ibride SSM
-- Stati ricorrenti lineari + full attention ogni N layer (stile Qwen3.5)
+## ✅ F5 — Architetture ibride SSM (Qwen3.5-0.8B)
+- Gated DeltaNet + Full Attention ibrida: 6×(3×DeltaNet+FFN → 1×FullAttn+FFN) = 24 layer, 1024 embd, 3584 ffn, 8Q/2KV hd256, RoPE mrope 64/256 theta 1e7, conv_k 4, d_state 128
+- **Verifica (27/08 F16 golden, commit 45d129f)**: `/tmp/opencode/Qwen3.5-0.8B-F16.gguf` 1.55GB 335 tensori — hidden 0..23 maxdiff ~1e-6, logits maxdiff 9.5e-05 top5 identico vs HF float su Hello [9419]; Q4_K_M parity quantizzata documentata (mixed precision SBGQ)
+- Fix: conv_buf per-layer, g=-exp(A_log)*softplus, l2norm eps 1e-6, registry qwen3→Qwen35
 
-## 🔜 F6 — Speculative decoding corretto + MTP nativo
+## 🚧 F6 — KV-cache ibrida (DeltaNet state + Attention KV)
+- Stato per layer: DeltaNet → `RecurrentState` [d_state×d_state×n_v_heads] + conv_buf [conv_k×conv_dim]; Attention → `LayerKv` [max_seq×512]
+- Forward cached: prefill una volta, poi 1 token per passo — stesso invariante F2.5: `cached(prefill)+cached(decode) == full-recompute`
+- Prefix caching ibrido: riuso solo su prefisso esatto (truncate rifiutato su stati ricorrenti)
+- **Verifica**: parity cached vs full al byte su F16, greedy 12-token identico, misura tok/s
+- **Target**: da ~0.1 tok/s full-recompute a >0.5 tok/s CPU scalare (prima di F7 CUDA)
+
+## 🔜 F7 — Backend CUDA sovrano (cusp-rs, zero cuBLASLt se ≥40 tok/s su 3090)
+- Pesi e KV/state DeltaNet residenti su device, kernel fused attention + SSM, dequant-matmul K-quants on-device
+
+## 🔜 F8 — Speculative decoding corretto + MTP nativo
 - Rejection sampling con distribuzioni complete, accesso diretto agli hidden state
 
-## 🔜 F7 — Multi-utente
+## 🔜 F9 — Multi-utente
 - Continuous batching, scheduler, metriche

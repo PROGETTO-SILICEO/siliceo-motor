@@ -295,6 +295,7 @@ mod tests {
 
     impl Device for FakeDevice {
         type Cache = FakeCache;
+        type Config = Config;
 
         fn config(&self) -> &Config {
             &self.config

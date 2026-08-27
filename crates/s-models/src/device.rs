@@ -15,14 +15,14 @@
 //! architettura. La parity cross-backend si verifica con lo stesso test
 //! greedy multi-token usato per F1/F2.
 
-use crate::qwen2::Config;
-
 /// Un backend di forward: CPU oggi, CUDA domani, Vulkan dopo.
+/// F6: generalizzato per famiglie multiple (qwen2, qwen35) via Config associato.
 pub trait Device {
     /// Cache specifica del backend (host Vec per CPU, buffer device per GPU).
     type Cache;
+    type Config;
 
-    fn config(&self) -> &Config;
+    fn config(&self) -> &Self::Config;
 
     /// Cache dimensionata per una sequenza massima `max_seq`.
     fn new_cache(&self, max_seq: usize) -> Self::Cache;

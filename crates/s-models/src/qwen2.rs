@@ -622,7 +622,9 @@ impl Model {
 
 // ── backend CPU: implementazione del trait Device ──
 
-impl Device for Model {    type Cache = SeqState;
+impl Device for Model {
+    type Cache = SeqState;
+    type Config = Config;
 
     fn config(&self) -> &Config {
         &self.config

@@ -607,6 +607,7 @@ fn bias_args(
 /// Impl del trait: K/V su device, il Cache è solo il contatore di posizione.
 impl Device for GpuQwen2 {
     type Cache = GpuCache;
+    type Config = Config;
 
     fn config(&self) -> &Config {
         &self.config
