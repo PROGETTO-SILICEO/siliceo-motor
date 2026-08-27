@@ -16,8 +16,11 @@ use s_gguf::GgufFile;
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Famiglia {
     /// qwen2 / llama (llama con bias QKV opzionale). Dense attention su
-    /// tutti i layer. È l'UNICA famiglia servita oggi.
+    /// tutti i layer.
     Qwen2Llama,
+    /// Qwen3.5 — ibrida Gated DeltaNet + Full Attention (24 layer,
+    /// 18 DeltaNet ricorrenti + 6 full attention).
+    Qwen35,
 }
 
 impl Famiglia {
@@ -25,6 +28,7 @@ impl Famiglia {
     pub fn arch(self) -> &'static str {
         match self {
             Famiglia::Qwen2Llama => "qwen2/llama",
+            Famiglia::Qwen35 => "qwen35",
         }
     }
 
@@ -34,6 +38,7 @@ impl Famiglia {
     pub fn from_arch(arch: &str) -> Option<Self> {
         match arch {
             "qwen2" | "llama" => Some(Famiglia::Qwen2Llama),
+            "qwen3" | "qwen35" => Some(Famiglia::Qwen35),
             _ => None,
         }
     }
@@ -50,7 +55,7 @@ impl Famiglia {
             .and_then(|(_, v)| v.as_str())
             .ok_or("metadata mancante: general.architecture")?;
         Self::from_arch(arch).ok_or(format!(
-            "architettura '{arch}' non supportata (supportate: qwen2, llama)"
+            "architettura '{arch}' non supportata (supportate: qwen2, llama, qwen35)"
         ))
     }
 }
@@ -63,9 +68,10 @@ mod tests {
     fn architetture_dense_riconosciute() {
         assert_eq!(Famiglia::from_arch("qwen2"), Some(Famiglia::Qwen2Llama));
         assert_eq!(Famiglia::from_arch("llama"), Some(Famiglia::Qwen2Llama));
+        assert_eq!(Famiglia::from_arch("qwen35"), Some(Famiglia::Qwen35));
+        assert_eq!(Famiglia::from_arch("qwen3"), Some(Famiglia::Qwen35));
         // smollm ha layout proprio (prefisso diverso): NON si mappa per speranza
         assert_eq!(Famiglia::from_arch("smollm"), None);
-        assert_eq!(Famiglia::from_arch("qwen3"), None);
     }
 
     /// Il formato dell'errore di detect() per arch sconosciuta: nomina sia
@@ -77,10 +83,10 @@ mod tests {
             "{}",
             Famiglia::from_arch("gemma3")
                 .map(|f| f.arch().to_string())
-                .unwrap_or_else(|| "architettura 'gemma3' non supportata (supportate: qwen2, llama)"
+                .unwrap_or_else(|| "architettura 'gemma3' non supportata (supportate: qwen2, llama, qwen35)"
                     .to_string())
         );
         assert!(msg.contains("'gemma3'"));
-        assert!(msg.contains("qwen2, llama"));
+        assert!(msg.contains("qwen2, llama, qwen35"));
     }
 }

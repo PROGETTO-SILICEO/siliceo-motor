@@ -48,6 +48,20 @@ pub fn get_scale_min_k4(j: usize, scales: &[u8]) -> (u8, u8) {
     }
 }
 
+/// Dequantizza un blocco Q4_0 (18 byte → 32 f32).
+/// Layout: [d:fp16][qs:16 byte — 32 nibbles].
+/// Formula: y[i] = d * q[i], dove q[i] è il nibble a 4 bit (unsigned).
+pub fn dequant_q4_0(block: &[u8], out: &mut [f32]) {
+    let d = fp16_to_f32(block[0] as u16 | ((block[1] as u16) << 8));
+    let qs = &block[2..18];
+    for i in 0..16 {
+        let q_lo = (qs[i] & 0x0F) as f32;
+        let q_hi = (qs[i] >> 4) as f32;
+        out[i] = d * q_lo;
+        out[i + 16] = d * q_hi;
+    }
+}
+
 /// Dequantizza un blocco Q8_0 (34 byte → 32 f32). Layout: [d:fp16][qs:32×i8].
 pub fn dequant_q8_0(block: &[u8], out: &mut [f32]) {
     let d = fp16_to_f32(block[0] as u16 | ((block[1] as u16) << 8));
@@ -102,6 +116,54 @@ pub fn dequant_q4_k(block: &[u8], out: &mut [f32]) {
         }
         for l in 0..32 {
             out[idx + 32 + l] = d2 * (qs[qoff + l] >> 4) as f32 - m2;
+        }
+        qoff += 32;
+        idx += 64;
+        is += 2;
+    }
+}
+
+/// Dequantizza un blocco Q4_1 (20 byte → 32 f32). Layout: [d:fp16][dmin:fp16][qs:16 byte].
+/// Formula: y[i] = d * q[i] + dmin, dove q[i] è il nibble a 4 bit.
+pub fn dequant_q4_1(block: &[u8], out: &mut [f32]) {
+    let d = fp16_to_f32(block[0] as u16 | ((block[1] as u16) << 8));
+    let dm = fp16_to_f32(block[2] as u16 | ((block[3] as u16) << 8));
+    let qs = &block[4..20];
+    for i in 0..16 {
+        out[i] = d * (qs[i] & 0x0F) as f32 + dm;
+        out[i + 16] = d * (qs[i] >> 4) as f32 + dm;
+    }
+}
+
+/// Dequantizza un blocco Q5_K (176 byte → 256 f32).
+/// Layout: [d:fp16][dmin:fp16][scales:12][qh:32][qs:128].
+/// Formula: x = d*ds*q - dmin*ms, dove q è 5-bit centrato (0..31).
+pub fn dequant_q5_k(block: &[u8], out: &mut [f32]) {
+    let d = fp16_to_f32(block[0] as u16 | ((block[1] as u16) << 8));
+    let mn = fp16_to_f32(block[2] as u16 | ((block[3] as u16) << 8));
+    let scales = &block[4..16];
+    let qh = &block[16..48];
+    let qs = &block[48..176];
+
+    let mut is = 0usize;
+    let mut idx = 0usize;
+    let mut qoff = 0usize;
+    for _j in 0..(256 / 64) {
+        let (ds1, ms1) = get_scale_min_k4(is, scales);
+        let d1 = d * ds1 as f32;
+        let m1 = mn * ms1 as f32;
+        let (ds2, ms2) = get_scale_min_k4(is + 1, scales);
+        let d2 = d * ds2 as f32;
+        let m2 = mn * ms2 as f32;
+        for l in 0..32 {
+            let h = (qh[l] >> 0) & 1;
+            let q = (qs[qoff + l] & 0x0F) as f32 + (h as f32) * 16.0;
+            out[idx + l] = d1 * q - m1;
+        }
+        for l in 0..32 {
+            let h = (qh[l] >> 4) & 1;
+            let q = (qs[qoff + l] >> 4) as f32 + (h as f32) * 16.0;
+            out[idx + 32 + l] = d2 * q - m2;
         }
         qoff += 32;
         idx += 64;
@@ -173,6 +235,24 @@ pub fn dequantize(info: &TensorInfo, raw: &[u8]) -> Result<Vec<f32>> {
                 out[i] = bf16_to_f32(chunk[0] as u16 | ((chunk[1] as u16) << 8));
             }
         }
+        GgmlType::Q4_0 => {
+            let (bs, tb) = GgmlType::Q4_0.block_layout();
+            let mut off = 0usize;
+            for block in raw.chunks_exact(tb) {
+                if off + bs > n { break; }
+                dequant_q4_0(block, &mut out[off..off + bs]);
+                off += bs;
+            }
+        }
+        GgmlType::Q4_1 => {
+            let (bs, tb) = GgmlType::Q4_1.block_layout();
+            let mut off = 0usize;
+            for block in raw.chunks_exact(tb) {
+                if off + bs > n { break; }
+                dequant_q4_1(block, &mut out[off..off + bs]);
+                off += bs;
+            }
+        }
         GgmlType::Q5_0 => {
             let (bs, tb) = GgmlType::Q5_0.block_layout();
             let mut off = 0usize;
@@ -198,6 +278,15 @@ pub fn dequantize(info: &TensorInfo, raw: &[u8]) -> Result<Vec<f32>> {
             for block in raw.chunks_exact(tb) {
                 if off + bs > n { break; }
                 dequant_q4_k(block, &mut out[off..off + bs]);
+                off += bs;
+            }
+        }
+        GgmlType::Q5K => {
+            let (bs, tb) = GgmlType::Q5K.block_layout();
+            let mut off = 0usize;
+            for block in raw.chunks_exact(tb) {
+                if off + bs > n { break; }
+                dequant_q5_k(block, &mut out[off..off + bs]);
                 off += bs;
             }
         }

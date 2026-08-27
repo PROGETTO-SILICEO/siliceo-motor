@@ -264,3 +264,4 @@ impl<R: Read> ReadBytes for StreamReader<R> {
         Ok(self.pos)
     }
 }
+
