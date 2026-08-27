@@ -553,3 +553,67 @@ pub unsafe fn delta_recurrent_step_f32(
         j += 1;
     }
 }
+
+/// RoPE MRoPE parziale: ruota solo i primi n_rot dims per testa (half = n_rot/2).
+#[kernel]
+#[allow(improper_ctypes_definitions)]
+pub unsafe fn rope_mrope_f32(
+    x: *mut f32,
+    seq: u32,
+    n_heads: u32,
+    hd: u32,
+    theta: f32,
+    pos0: u32,
+    n_rot: u32,
+) {
+    let half = hd / 2;
+    let half_rot = n_rot / 2;
+    let total = seq * n_heads * half_rot;
+    let idx = index_1d();
+    if idx >= total {
+        return;
+    }
+    let i = idx % half_rot;
+    let sh = idx / half_rot;
+    let h = sh % n_heads;
+    let s = sh / n_heads;
+    let freq = powf(theta, -(2.0 * i as f32) / hd as f32);
+    let angle = (s + pos0) as f32 * freq;
+    let sin = sinf(angle);
+    let cos = cosf(angle);
+    let base = ((s * n_heads + h) * hd) as usize;
+    let x0 = *x.add(base + i as usize);
+    let x1 = *x.add(base + (i + half) as usize);
+    *x.add(base + i as usize) = x0 * cos - x1 * sin;
+    *x.add(base + (i + half) as usize) = x0 * sin + x1 * cos;
+}
+
+/// RMSNorm per testa: per ogni testa h, x[h*hd..(h+1)*hd] /= sqrt(mean(x²)+eps) * w[h*hd..].
+#[kernel]
+#[allow(improper_ctypes_definitions)]
+pub unsafe fn rmsnorm_per_head_f32(
+    x: *mut f32,
+    w: *const f32,
+    n_heads: u32,
+    hd: u32,
+    eps: f32,
+) {
+    let h = index_1d();
+    if h >= n_heads {
+        return;
+    }
+    let base = (h * hd) as usize;
+    let mut ss = 0.0f32;
+    let mut i = 0u32;
+    while i < hd {
+        let v = *x.add(base + i as usize);
+        ss += v * v;
+        i += 1;
+    }
+    let inv = 1.0 / sqrtf(ss / hd as f32 + eps);
+    i = 0;
+    while i < hd {
+        *x.add(base + i as usize) = *x.add(base + i as usize) * inv * *w.add(base + i as usize);
+        i += 1;
+    }
+}
