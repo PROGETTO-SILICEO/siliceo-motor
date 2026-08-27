@@ -731,4 +731,170 @@ mod smoke {
         println!("delta recurrent max_err = {max_err:.3e}");
         assert!(max_err < 1e-4, "parity delta recurrent: {max_err}");
     }
+
+    // ── Helpers quantizzazione ──
+    fn quantize_q8_0_cpu(data: &[f32]) -> Vec<u8> {
+        assert!(data.len() % 32 == 0);
+        let mut out = Vec::with_capacity(data.len()/32*34);
+        for block in data.chunks(32) {
+            let max = block.iter().map(|v| v.abs()).fold(0.0f32, f32::max);
+            let d = if max == 0.0 { 0.0 } else { max / 127.0 };
+            let inv = if d==0.0 { 0.0 } else { 1.0/d };
+            let h = if d==0.0 { 0u16 } else {
+                // fp16 encode via bit trick? usa f32->f16 via rounding semplice
+                // Per parity usiamo il riferimento s-gguf: quantizza poi dequantizza identico
+                // Qui codifichiamo d come fp16 tramite conversione host
+                let bits = d.to_bits();
+                let sign = (bits>>31)&1;
+                let exp = ((bits>>23)&0xFF) as i32 -127 +15;
+                let frac = (bits>>13)&0x3FF;
+                if exp <=0 { 0 } else if exp>=31 { 0x7C00 | (frac as u16) } else { ((sign<<15)|((exp as u32)<<10)|frac) as u16 }
+            };
+            out.push((h & 0xFF) as u8);
+            out.push((h>>8) as u8);
+            for &v in block {
+                let q = if d==0.0 { 0 } else { (v*inv).round().clamp(-128.0,127.0) as i8 };
+                out.push(q as u8);
+            }
+        }
+        out
+    }
+
+    fn dequant_q8_0_cpu(q: &[u8], n: usize) -> Vec<f32> {
+        let mut out = vec![0.0f32; n];
+        let mut off = 0usize;
+        for block in q.chunks(34) {
+            let h = block[0] as u16 | ((block[1] as u16)<<8);
+            let sign = ((h>>15)&1) as u32;
+            let exp = ((h>>10)&0x1F) as u32;
+            let frac = (h & 0x3FF) as u32;
+            let d = if exp==0 && frac==0 { 0.0 } else if exp==0 { (frac as f32)*5.9604645e-8 } else if exp==0x1F {
+                f32::from_bits((sign<<31)|(0xFF<<23)|(if frac==0 {0} else {0x200_000<<13}))
+            } else { f32::from_bits((sign<<31)|((exp+127-15)<<23)|(frac<<13)) };
+            for i in 0..32 {
+                out[off+i] = block[2+i] as i8 as f32 * d;
+            }
+            off+=32;
+        }
+        out
+    }
+
+    fn dequant_q4_k_cpu(block: &[u8], out: &mut [f32]) {
+        let d = {
+            let h = block[0] as u16 | ((block[1] as u16)<<8);
+            let sign = ((h>>15)&1) as u32; let exp = ((h>>10)&0x1F) as u32; let frac=(h&0x3FF) as u32;
+            if exp==0 && frac==0 {0.0} else if exp==0 {(frac as f32)*5.9604645e-8} else if exp==0x1F{f32::from_bits((sign<<31)|(0xFF<<23)|0)} else {f32::from_bits((sign<<31)|((exp+127-15)<<23)|(frac<<13))}
+        };
+        let dm = {
+            let h = block[2] as u16 | ((block[3] as u16)<<8);
+            let sign = ((h>>15)&1) as u32; let exp = ((h>>10)&0x1F) as u32; let frac=(h&0x3FF) as u32;
+            if exp==0 && frac==0 {0.0} else if exp==0 {(frac as f32)*5.9604645e-8} else if exp==0x1F{f32::from_bits((sign<<31)|(0xFF<<23)|0)} else {f32::from_bits((sign<<31)|((exp+127-15)<<23)|(frac<<13))}
+        };
+        let scales = &block[4..16];
+        let qs = &block[16..144];
+        let get = |j: usize| -> (u8,u8) {
+            if j<4 {(scales[j]&63, scales[j+4]&63)} else {let d=(scales[j+4]&0x0F)|((scales[j-4]>>6)<<4); let m=(scales[j+4]>>4)|((scales[j]>>6)<<4); (d,m)}
+        };
+        let mut is=0usize; let mut qoff=0usize; let mut idx=0usize;
+        for _ in 0..4 {
+            let (ds1,ms1)=get(is); let d1=d*ds1 as f32; let m1=dm*ms1 as f32;
+            let (ds2,ms2)=get(is+1); let d2=d*ds2 as f32; let m2=dm*ms2 as f32;
+            for l in 0..32 { out[idx+l]=d1*(qs[qoff+l]&0x0F) as f32 - m1; }
+            for l in 0..32 { out[idx+32+l]=d2*(qs[qoff+l]>>4) as f32 - m2; }
+            qoff+=32; idx+=64; is+=2;
+        }
+    }
+
+    fn quantize_q4_k_fake(n: usize, seed: u64) -> (Vec<u8>, Vec<f32>) {
+        // genera pesi f32 e quantizza via s-gguf? Per test parity facciamo
+        // dequant da bytes casuali validi — l'importante è che CPU e GPU
+        // usino la stessa dequant.
+        let raw: Vec<u8> = lcg_input(n/256*144, seed).iter().map(|&v| ((v+1.0)*127.5) as u8).collect();
+        // sistema scale/d per avere valori finiti
+        let mut fixed = raw.clone();
+        for blk in 0..n/256 {
+            let base = blk*144;
+            // metti d=0.01 circa (fp16 0x211E ~0.01)
+            fixed[base]=0x1E; fixed[base+1]=0x21;
+            fixed[base+2]=0x00; fixed[base+3]=0x20; // dmin ~0.003
+            for i in 0..12 { fixed[base+4+i]= (0x10 + (i as u8*5)) & 0x3F; }
+        }
+        let mut deq = vec![0.0f32; n];
+        for (blk, chunk) in fixed.chunks(144).enumerate() {
+            dequant_q4_k_cpu(chunk, &mut deq[blk*256..(blk+1)*256]);
+        }
+        (fixed, deq)
+    }
+
+    #[test]
+    fn matmul_q8_0_parity_contro_cpu() {
+        const SEQ: usize = 2;
+        const N_OUT: usize = 4;
+        const N_IN: usize = 64;
+        let gpu = Gpu::new().unwrap();
+        let func = gpu.function("matmul_q8_0_f32").unwrap();
+        let x: Vec<f32> = lcg_input(SEQ*N_IN, 0x123456).iter().map(|&v| v*0.5).collect();
+        let w_f32: Vec<f32> = lcg_input(N_OUT*N_IN, 0xABCDEF).iter().map(|&v| v*0.5).collect();
+        let mut w_q = Vec::new();
+        for row in 0..N_OUT {
+            let row_f = &w_f32[row*N_IN..(row+1)*N_IN];
+            w_q.extend(quantize_q8_0_cpu(row_f));
+        }
+        // CPU reference: dequant + matmul
+        let w_deq: Vec<f32> = w_q.chunks(34).flat_map(|b| {
+            let mut out=[0.0f32;32];
+            let h=b[0] as u16|((b[1] as u16)<<8);
+            let sign=((h>>15)&1) as u32; let exp=((h>>10)&0x1F) as u32; let frac=(h&0x3FF) as u32;
+            let d= if exp==0 && frac==0 {0.0} else if exp==0 {(frac as f32)*5.9604645e-8} else {f32::from_bits((sign<<31)|((exp+127-15)<<23)|(frac<<13))};
+            for i in 0..32 { out[i]=b[2+i] as i8 as f32*d; }
+            out.to_vec()
+        }).collect();
+        // w_deq is row-major, but our chunking was per row already: w_deq length = N_OUT*N_IN
+        let expected = matmul_rows_cpu(&w_deq, N_OUT, N_IN, &x, SEQ);
+        let d_x = DeviceBuffer::from_slice(&x).unwrap();
+        let d_w = DeviceBuffer::from_slice(&w_q).unwrap();
+        let d_y = DeviceBuffer::<f32>::zeroed(SEQ*N_OUT).unwrap();
+        let total=(SEQ*N_OUT) as u32;
+        let stream=&gpu.stream;
+        unsafe { launch!(func<<<total.div_ceil(256), 256, 0, stream>>>(d_x.as_device_ptr(), d_w.as_device_ptr(), d_y.as_device_ptr(), SEQ as u32, N_OUT as u32, N_IN as u32)).unwrap(); }
+        gpu.stream.synchronize().unwrap();
+        let mut got=vec![0.0f32; SEQ*N_OUT];
+        d_y.copy_to(&mut got).unwrap();
+        let mut max_err=0.0f32;
+        for (g,e) in got.iter().zip(expected.iter()) { max_err=max_err.max((g-e).abs()); }
+        println!("matmul_q8_0 max_err = {max_err:.3e}");
+        assert!(max_err < 1e-3, "parity q8_0: {max_err}");
+    }
+
+    #[test]
+    fn matmul_q4_k_parity_contro_cpu() {
+        const SEQ: usize = 2;
+        const N_OUT: usize = 2;
+        const N_IN: usize = 512;
+        let gpu = Gpu::new().unwrap();
+        let func = gpu.function("matmul_q4_k_f32").unwrap();
+        let x: Vec<f32> = lcg_input(SEQ*N_IN, 0x777).iter().map(|&v| v*0.3).collect();
+        // genera pesi Q4_K casuali validi e dequant CPU
+        let mut w_q = Vec::new();
+        let mut w_deq = Vec::new();
+        for idx in 0..N_OUT {
+            let (q, dq) = quantize_q4_k_fake(N_IN, 0x999 + idx as u64 * 0x111);
+            w_q.extend(q);
+            w_deq.extend(dq);
+        }
+        let expected = matmul_rows_cpu(&w_deq, N_OUT, N_IN, &x, SEQ);
+        let d_x = DeviceBuffer::from_slice(&x).unwrap();
+        let d_w = DeviceBuffer::from_slice(&w_q).unwrap();
+        let d_y = DeviceBuffer::<f32>::zeroed(SEQ*N_OUT).unwrap();
+        let total=(SEQ*N_OUT) as u32;
+        let stream=&gpu.stream;
+        unsafe { launch!(func<<<total.div_ceil(256), 256, 0, stream>>>(d_x.as_device_ptr(), d_w.as_device_ptr(), d_y.as_device_ptr(), SEQ as u32, N_OUT as u32, N_IN as u32)).unwrap(); }
+        gpu.stream.synchronize().unwrap();
+        let mut got=vec![0.0f32; SEQ*N_OUT];
+        d_y.copy_to(&mut got).unwrap();
+        let mut max_err=0.0f32;
+        for (g,e) in got.iter().zip(expected.iter()) { max_err=max_err.max((g-e).abs()); }
+        println!("matmul_q4_k max_err = {max_err:.3e}");
+        assert!(max_err < 2e-3, "parity q4_k: {max_err}");
+    }
 }

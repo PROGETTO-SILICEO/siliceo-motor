@@ -675,3 +675,262 @@ pub unsafe fn scale_f32(x: *mut f32, n: u32, scale: f32) {
         *x.add(i as usize) *= scale;
     }
 }
+
+// ── Helpers dequantizzazione (copia fedele di s-gguf/dequant.rs) ──
+
+#[inline(always)]
+fn fp16_to_f32_gpu(h: u16) -> f32 {
+    let sign = ((h >> 15) & 1) as u32;
+    let exp = ((h >> 10) & 0x1F) as u32;
+    let frac = (h & 0x3FF) as u32;
+    if exp == 0 {
+        if frac == 0 {
+            return f32::from_bits(sign << 31);
+        } else {
+            let val = (frac as f32) * 5.9604645e-8f32;
+            return if sign == 1 { -val } else { val };
+        }
+    }
+    if exp == 0x1F {
+        let e = 0xFF;
+        let f = if frac == 0 { 0 } else { 0x200_000 };
+        return f32::from_bits((sign << 31) | (e << 23) | (f << 13));
+    }
+    let e = exp + 127 - 15;
+    let f = frac;
+    f32::from_bits((sign << 31) | (e << 23) | (f << 13))
+}
+
+/// y[seq×n_out] = x[seq×n_in] @ W_q8_0^T  — W quantizzata Q8_0 (34B/blocco, 32 elem)
+/// Stessa semantica di matmul_wt_f32, ma legge W da bytes quantizzati.
+/// Un thread per elemento di output, dequant on-the-fly.
+#[kernel]
+#[allow(improper_ctypes_definitions)]
+pub unsafe fn matmul_q8_0_f32(
+    x: *const f32,
+    w: *const u8,
+    y: *mut f32,
+    seq: u32,
+    n_out: u32,
+    n_in: u32,
+) {
+    let idx = index_1d();
+    if idx >= seq * n_out { return; }
+    let s = idx / n_out;
+    let o = idx % n_out;
+    let x_row = x.add((s * n_in) as usize);
+    let row_bytes = (n_in / 32) * 34;
+    let w_row = w.add((o * row_bytes) as usize);
+    let n_blocks = n_in / 32;
+    let mut acc = 0.0f32;
+    let mut b = 0u32;
+    while b < n_blocks {
+        let base = (b * 34) as usize;
+        let h = (*w_row.add(base) as u16) | ((*w_row.add(base + 1) as u16) << 8);
+        let d = fp16_to_f32_gpu(h);
+        let mut j = 0u32;
+        while j < 32 {
+            let q = *w_row.add(base + 2 + j as usize) as i8 as f32;
+            let xv = *x_row.add((b * 32 + j) as usize);
+            acc += xv * q * d;
+            j += 1;
+        }
+        b += 1;
+    }
+    *y.add(idx as usize) = acc;
+}
+
+/// Q4_K helper: get_scale_min_k4
+#[inline(always)]
+fn get_scale_min_k4_gpu(j: usize, scales: *const u8) -> (u8, u8) {
+    unsafe {
+        if j < 4 {
+            (*scales.add(j) & 63, *scales.add(j + 4) & 63)
+        } else {
+            let d = (*scales.add(j + 4) & 0x0F) | ((*scales.add(j - 4) >> 6) << 4);
+            let m = (*scales.add(j + 4) >> 4) | ((*scales.add(j) >> 6) << 4);
+            (d, m)
+        }
+    }
+}
+
+/// y = x @ W_q4k^T  — W quantizzata Q4_K (144B/blocco, 256 elem: d,dmin,scales,qs)
+#[kernel]
+#[allow(improper_ctypes_definitions)]
+pub unsafe fn matmul_q4_k_f32(
+    x: *const f32,
+    w: *const u8,
+    y: *mut f32,
+    seq: u32,
+    n_out: u32,
+    n_in: u32,
+) {
+    let idx = index_1d();
+    if idx >= seq * n_out { return; }
+    let s = idx / n_out;
+    let o = idx % n_out;
+    let x_row = x.add((s * n_in) as usize);
+    let row_bytes = (n_in / 256) * 144;
+    let w_row = w.add((o * row_bytes) as usize);
+    let n_blocks = n_in / 256;
+    let mut acc = 0.0f32;
+    let mut blk = 0u32;
+    while blk < n_blocks {
+        let base = (blk * 144) as usize;
+        let d = fp16_to_f32_gpu((*w_row.add(base) as u16) | ((*w_row.add(base+1) as u16)<<8));
+        let dm = fp16_to_f32_gpu((*w_row.add(base+2) as u16) | ((*w_row.add(base+3) as u16)<<8));
+        let scales = w_row.add(base+4);
+        let qs = w_row.add(base+16);
+        let mut is = 0usize;
+        let mut qoff = 0usize;
+        let mut base_x = (blk * 256) as usize;
+        // 4 gruppi da 64
+        let mut g = 0usize;
+        while g < 4 {
+            let (ds1, ms1) = get_scale_min_k4_gpu(is, scales);
+            let d1 = d * ds1 as f32;
+            let m1 = dm * ms1 as f32;
+            let (ds2, ms2) = get_scale_min_k4_gpu(is+1, scales);
+            let d2 = d * ds2 as f32;
+            let m2 = dm * ms2 as f32;
+            let mut l = 0usize;
+            while l < 32 {
+                let q = (*qs.add(qoff + l) & 0x0F) as f32;
+                acc += *x_row.add(base_x + l) * (d1 * q - m1);
+                l += 1;
+            }
+            l = 0;
+            while l < 32 {
+                let q = (*qs.add(qoff + l) >> 4) as f32;
+                acc += *x_row.add(base_x + 32 + l) * (d2 * q - m2);
+                l += 1;
+            }
+            qoff += 32;
+            base_x += 64;
+            is += 2;
+            g += 1;
+        }
+        blk += 1;
+    }
+    *y.add(idx as usize) = acc;
+}
+
+/// y = x @ W_q6k^T  — W quantizzata Q6_K (210B/blocco, 256 elem: ql,qh,scales,d)
+#[kernel]
+#[allow(improper_ctypes_definitions)]
+pub unsafe fn matmul_q6_k_f32(
+    x: *const f32,
+    w: *const u8,
+    y: *mut f32,
+    seq: u32,
+    n_out: u32,
+    n_in: u32,
+) {
+    let idx = index_1d();
+    if idx >= seq * n_out { return; }
+    let s = idx / n_out;
+    let o = idx % n_out;
+    let x_row = x.add((s * n_in) as usize);
+    let row_bytes = (n_in / 256) * 210;
+    let w_row = w.add((o * row_bytes) as usize);
+    let n_blocks = n_in / 256;
+    let mut acc = 0.0f32;
+    let mut blk = 0u32;
+    while blk < n_blocks {
+        let base = (blk * 210) as usize;
+        let ql = w_row.add(base);
+        let qh = w_row.add(base+128);
+        let sc = w_row.add(base+192);
+        let d = fp16_to_f32_gpu((*w_row.add(base+208) as u16) | ((*w_row.add(base+209) as u16)<<8));
+        if !d.is_finite() { blk+=1; continue; }
+        let mut yoff = 0usize;
+        let mut n = 0usize;
+        while n < 2 {
+            let qloff = n*64;
+            let qhoff = n*32;
+            let scoff = n*8;
+            let mut l = 0usize;
+            while l < 32 {
+                let is = l/16;
+                let sc0 = *sc.add(scoff+is) as i8 as f32;
+                let sc1 = *sc.add(scoff+is+2) as i8 as f32;
+                let sc2 = *sc.add(scoff+is+4) as i8 as f32;
+                let sc3 = *sc.add(scoff+is+6) as i8 as f32;
+                let q1 = ((*ql.add(qloff+l) & 0x0F) as i32 | (((*qh.add(qhoff+l)>>0)&3) as i32)<<4) - 32;
+                let q2 = ((*ql.add(qloff+l+32) & 0x0F) as i32 | (((*qh.add(qhoff+l)>>2)&3) as i32)<<4) - 32;
+                let q3 = ((*ql.add(qloff+l)>>4) as i32 | (((*qh.add(qhoff+l)>>4)&3) as i32)<<4) - 32;
+                let q4 = ((*ql.add(qloff+l+32)>>4) as i32 | (((*qh.add(qhoff+l)>>6)&3) as i32)<<4) - 32;
+                let base_x = (blk as usize*256) + yoff + l;
+                acc += *x_row.add(base_x) * d * sc0 * q1 as f32;
+                acc += *x_row.add(base_x+32) * d * sc1 * q2 as f32;
+                acc += *x_row.add(base_x+64) * d * sc2 * q3 as f32;
+                acc += *x_row.add(base_x+96) * d * sc3 * q4 as f32;
+                l+=1;
+            }
+            yoff+=128;
+            n+=1;
+        }
+        blk+=1;
+    }
+    *y.add(idx as usize)=acc;
+}
+
+/// y = x @ W_q5k^T  — W quantizzata Q5_K (176B/blocco, 256 elem: d,dmin,scales,qh,qs)
+#[kernel]
+#[allow(improper_ctypes_definitions)]
+pub unsafe fn matmul_q5_k_f32(
+    x: *const f32,
+    w: *const u8,
+    y: *mut f32,
+    seq: u32,
+    n_out: u32,
+    n_in: u32,
+) {
+    let idx = index_1d();
+    if idx >= seq * n_out { return; }
+    let s = idx / n_out;
+    let o = idx % n_out;
+    let x_row = x.add((s * n_in) as usize);
+    let row_bytes = (n_in / 256) * 176;
+    let w_row = w.add((o * row_bytes) as usize);
+    let n_blocks = n_in / 256;
+    let mut acc = 0.0f32;
+    let mut blk = 0u32;
+    while blk < n_blocks {
+        let base = (blk * 176) as usize;
+        let d = fp16_to_f32_gpu((*w_row.add(base) as u16) | ((*w_row.add(base+1) as u16)<<8));
+        let dm = fp16_to_f32_gpu((*w_row.add(base+2) as u16) | ((*w_row.add(base+3) as u16)<<8));
+        let scales = w_row.add(base+4);
+        let qh = w_row.add(base+16);
+        let qs = w_row.add(base+48);
+        let mut is = 0usize;
+        let mut qoff = 0usize;
+        let mut base_x = (blk * 256) as usize;
+        let mut g = 0usize;
+        while g < 4 {
+            let (ds1, ms1) = get_scale_min_k4_gpu(is, scales);
+            let d1 = d * ds1 as f32;
+            let m1 = dm * ms1 as f32;
+            let (ds2, ms2) = get_scale_min_k4_gpu(is+1, scales);
+            let d2 = d * ds2 as f32;
+            let m2 = dm * ms2 as f32;
+            let mut l = 0usize;
+            while l < 32 {
+                let h = (*qh.add(l) >> 0) & 1;
+                let q = (*qs.add(qoff+l) & 0x0F) as f32 + h as f32 * 16.0;
+                acc += *x_row.add(base_x + l) * (d1 * q - m1);
+                l+=1;
+            }
+            l=0;
+            while l < 32 {
+                let h = (*qh.add(l) >> 4) & 1;
+                let q = (*qs.add(qoff+l) >> 4) as f32 + h as f32 * 16.0;
+                acc += *x_row.add(base_x+32+l) * (d2 * q - m2);
+                l+=1;
+            }
+            qoff+=32; base_x+=64; is+=2; g+=1;
+        }
+        blk+=1;
+    }
+    *y.add(idx as usize)=acc;
+}
