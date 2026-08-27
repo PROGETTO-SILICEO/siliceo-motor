@@ -617,3 +617,61 @@ pub unsafe fn rmsnorm_per_head_f32(
         i += 1;
     }
 }
+
+/// Split QK-Gate per Qwen3.5 attention: q_full [seq*4096] -> q[seq*2048] + gate[seq*2048]
+/// Layout HF: per testa h, q_full[h*512 .. h*512+256]=q, +256=gate.
+/// Un thread per elemento di q/gate (seq*2048 threads): copia entrambe.
+#[kernel]
+#[allow(improper_ctypes_definitions)]
+pub unsafe fn split_q_gate_f32(
+    q_full: *const f32,
+    q_out: *mut f32,
+    gate_out: *mut f32,
+    seq: u32,
+) {
+    let idx = index_1d();
+    let total = seq * 2048;
+    if idx >= total {
+        return;
+    }
+    let s = idx / 2048;
+    let rem = idx % 2048;
+    let h = rem / 256;
+    let d = rem % 256;
+    let src_q = (s * 4096 + h * 512 + d) as usize;
+    let dst = (s * 2048 + h * 256 + d) as usize;
+    *q_out.add(dst) = *q_full.add(src_q);
+    *gate_out.add(dst) = *q_full.add(src_q + 256);
+}
+
+/// Gating attention: out[i] *= sigmoid(gate[i])  — in place su attn_out.
+#[kernel]
+#[allow(improper_ctypes_definitions)]
+pub unsafe fn gate_sigmoid_mul_f32(attn_out: *mut f32, gate: *const f32, n: u32) {
+    let i = index_1d();
+    if i < n {
+        let g = *gate.add(i as usize);
+        let sig = 1.0 / (1.0 + expf(-g));
+        *attn_out.add(i as usize) *= sig;
+    }
+}
+
+/// Azzera buffer: x[i]=0.
+#[kernel]
+#[allow(improper_ctypes_definitions)]
+pub unsafe fn zero_f32(x: *mut f32, n: u32) {
+    let i = index_1d();
+    if i < n {
+        *x.add(i as usize) = 0.0;
+    }
+}
+
+/// Scala vettore: x[i] *= scale.
+#[kernel]
+#[allow(improper_ctypes_definitions)]
+pub unsafe fn scale_f32(x: *mut f32, n: u32, scale: f32) {
+    let i = index_1d();
+    if i < n {
+        *x.add(i as usize) *= scale;
+    }
+}
