@@ -992,6 +992,90 @@ impl Model {
     }
 }
 
+pub struct Qwen35DeltaView<'a> {
+    pub attn_norm: &'a [f32],
+    pub qkv: &'a [f32],
+    pub gate: &'a [f32],
+    pub conv1d: &'a [f32],
+    pub dt_bias: &'a [f32],
+    pub ssm_a: &'a [f32],
+    pub alpha: &'a [f32],
+    pub beta: &'a [f32],
+    pub ssm_norm: &'a [f32],
+    pub ssm_out: &'a [f32],
+    pub post_norm: &'a [f32],
+    pub ffn_gate: &'a [f32],
+    pub ffn_up: &'a [f32],
+    pub ffn_down: &'a [f32],
+}
+
+pub struct Qwen35AttentionView<'a> {
+    pub attn_norm: &'a [f32],
+    pub wq: &'a [f32],
+    pub wk: &'a [f32],
+    pub wv: &'a [f32],
+    pub wo: &'a [f32],
+    pub q_norm: &'a [f32],
+    pub k_norm: &'a [f32],
+    pub post_norm: &'a [f32],
+    pub ffn_gate: &'a [f32],
+    pub ffn_up: &'a [f32],
+    pub ffn_down: &'a [f32],
+}
+
+pub enum Qwen35LayerView<'a> {
+    DeltaNet(Qwen35DeltaView<'a>),
+    Attention(Qwen35AttentionView<'a>),
+}
+
+pub struct Qwen35WeightViews<'a> {
+    pub tok_embd: &'a [f32],
+    pub output: &'a [f32],
+    pub output_norm: &'a [f32],
+    pub layers: Vec<Qwen35LayerView<'a>>,
+}
+
+impl Model {
+    pub fn weight_views_for_gpu(&self) -> Qwen35WeightViews<'_> {
+        Qwen35WeightViews {
+            tok_embd: &self.tok_embd,
+            output: &self.output,
+            output_norm: &self.output_norm,
+            layers: self.layers.iter().map(|l| match l {
+                LayerWeights::DeltaNet(dn) => Qwen35LayerView::DeltaNet(Qwen35DeltaView {
+                    attn_norm: &dn.attn_norm,
+                    qkv: &dn.qkv,
+                    gate: &dn.gate,
+                    conv1d: &dn.conv1d,
+                    dt_bias: &dn.dt_bias,
+                    ssm_a: &dn.ssm_a,
+                    alpha: &dn.alpha,
+                    beta: &dn.beta,
+                    ssm_norm: &dn.ssm_norm,
+                    ssm_out: &dn.ssm_out,
+                    post_norm: &dn.post_norm,
+                    ffn_gate: &dn.ffn_gate,
+                    ffn_up: &dn.ffn_up,
+                    ffn_down: &dn.ffn_down,
+                }),
+                LayerWeights::Attention(at) => Qwen35LayerView::Attention(Qwen35AttentionView {
+                    attn_norm: &at.attn_norm,
+                    wq: &at.wq,
+                    wk: &at.wk,
+                    wv: &at.wv,
+                    wo: &at.wo,
+                    q_norm: &at.q_norm,
+                    k_norm: &at.k_norm,
+                    post_norm: &at.post_norm,
+                    ffn_gate: &at.ffn_gate,
+                    ffn_up: &at.ffn_up,
+                    ffn_down: &at.ffn_down,
+                }),
+            }).collect(),
+        }
+    }
+}
+
 // ── Device impl — F6: Qwen35 come backend per generate.rs / s-server ──
 impl crate::device::Device for Model {
     type Cache = SeqState;

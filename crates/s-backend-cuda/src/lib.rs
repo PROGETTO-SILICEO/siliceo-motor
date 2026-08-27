@@ -15,6 +15,8 @@
 #[cfg(feature = "cuda")]
 pub mod model;
 #[cfg(feature = "cuda")]
+pub mod model_qwen35;
+#[cfg(feature = "cuda")]
 pub mod runtime;
 
 /// true se questo binario è stato compilato col backend CUDA.

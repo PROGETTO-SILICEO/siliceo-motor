@@ -15,11 +15,12 @@
 //! - ogni kernel ha un test di parity contro la CPU in s-backend-cuda;
 //! - niente ottimizzazioni finché la parity non è verde.
 
+#![allow(unsafe_op_in_unsafe_fn)]
 // intrinsics nvptx ancora unstable sul nightly pinnato
 #![feature(stdarch_nvptx)]
 
 use cuda_std_macros::kernel;
-use libm::{cosf, expf, powf, sinf, sqrtf};
+use libm::{cosf, expf, logf, powf, sinf, sqrtf};
 
 /// Indice globale 1-D del thread (grid monodimensionale).
 #[inline(always)]
@@ -355,4 +356,200 @@ pub unsafe fn attn_weighted_sum_f32(
         t += 1;
     }
     *o = acc;
+}
+
+/// SiLU in place: x[i] = x[i] * sigmoid(x[i]) = x / (1+exp(-x)).
+#[kernel]
+#[allow(improper_ctypes_definitions)]
+pub unsafe fn silu_inplace_f32(x: *mut f32, n: u32) {
+    let i = index_1d();
+    if i < n {
+        let v = *x.add(i as usize);
+        *x.add(i as usize) = v / (1.0 + expf(-v));
+    }
+}
+
+/// L2 norm per testa: per ogni testa h, x[h*d_state..(h+1)*d_state] /= sqrt(sum(x²)+eps).
+/// eps = 1e-6 come HF/FLA.
+#[kernel]
+#[allow(improper_ctypes_definitions)]
+pub unsafe fn l2norm_per_head_f32(x: *mut f32, n_heads: u32, d_state: u32) {
+    let h = index_1d();
+    if h >= n_heads {
+        return;
+    }
+    let base = (h * d_state) as usize;
+    let mut ss = 0.0f32;
+    let mut i = 0u32;
+    while i < d_state {
+        let v = *x.add(base + i as usize);
+        ss += v * v;
+        i += 1;
+    }
+    let inv = 1.0 / sqrtf(ss + 1e-6);
+    i = 0;
+    while i < d_state {
+        *x.add(base + i as usize) *= inv;
+        i += 1;
+    }
+}
+
+/// Conv1D depthwise causale: conv_buf[K][D] shift + append + conv.
+/// conv_buf layout [K][D] row-major (K=conv_k, D=conv_dim).
+/// Weight layout [D][K] (d*K + k) come GGUF/HF.
+/// qkv_mixed = nuovo token [D], conv_out = output [D].
+/// Esegue: shift rows [1..K-1] -> [0..K-2], write qkv_mixed in row K-1, poi conv.
+#[kernel]
+#[allow(improper_ctypes_definitions)]
+pub unsafe fn conv1d_depthwise_f32(
+    conv_buf: *mut f32,
+    qkv_mixed: *const f32,
+    conv_weight: *const f32,
+    conv_out: *mut f32,
+    conv_k: u32,
+    conv_dim: u32,
+) {
+    let d = index_1d();
+    if d >= conv_dim {
+        return;
+    }
+    let row = conv_dim as usize;
+    // shift: per d fissato, muovi k+1 -> k
+    let mut k = 0u32;
+    while k + 1 < conv_k {
+        *conv_buf.add((k as usize * row) + d as usize) =
+            *conv_buf.add(((k + 1) as usize * row) + d as usize);
+        k += 1;
+    }
+    // append nuovo
+    *conv_buf.add(((conv_k - 1) as usize * row) + d as usize) = *qkv_mixed.add(d as usize);
+    // conv: sum_k w[d*K + k] * buf[k][d]
+    let mut sum = 0.0f32;
+    k = 0;
+    while k < conv_k {
+        let w = *conv_weight.add((d * conv_k + k) as usize);
+        let b = *conv_buf.add((k as usize * row) + d as usize);
+        sum += w * b;
+        k += 1;
+    }
+    *conv_out.add(d as usize) = sum;
+}
+
+/// Gate per DeltaNet: g[h] = -exp(A_log[h]) * softplus(alpha_dot[h] + dt_bias[h]).
+/// alpha_dot = alpha^T @ normed (già matmul), qui solo elementwise.
+/// Un thread per testa.
+#[kernel]
+#[allow(improper_ctypes_definitions)]
+pub unsafe fn delta_gate_f32(
+    alpha_dot: *const f32,
+    dt_bias: *const f32,
+    ssm_a: *const f32,
+    g_out: *mut f32,
+    n_heads: u32,
+) {
+    let h = index_1d();
+    if h >= n_heads {
+        return;
+    }
+    let a = *alpha_dot.add(h as usize) + *dt_bias.add(h as usize);
+    let sp = if a > 20.0 { a } else { logf(1.0 + expf(a)) };
+    let a_log = *ssm_a.add(h as usize);
+    *g_out.add(h as usize) = -expf(a_log) * sp;
+}
+
+/// Beta per DeltaNet: beta[h] = sigmoid(beta_dot[h]).
+#[kernel]
+#[allow(improper_ctypes_definitions)]
+pub unsafe fn delta_beta_f32(beta_dot: *const f32, beta_out: *mut f32, n_heads: u32) {
+    let h = index_1d();
+    if h >= n_heads {
+        return;
+    }
+    let v = *beta_dot.add(h as usize);
+    *beta_out.add(h as usize) = 1.0 / (1.0 + expf(-v));
+}
+
+/// DeltaNet recurrence fused per token (single token, seq=1).
+/// State layout per testa: [d_state × d_state] row-major, n_heads teste.
+/// Q/K/V per testa: [d_state] (Q/K) e [head_dim] (V, qui == d_state).
+/// g/beta per testa: scalar.
+/// out: [n_heads * head_dim] output.
+///
+#[kernel]
+#[allow(improper_ctypes_definitions)]
+pub unsafe fn delta_recurrent_step_f32(
+    state: *mut f32,
+    q: *const f32,
+    k: *const f32,
+    v: *const f32,
+    g: *const f32,
+    beta: *const f32,
+    out: *mut f32,
+    n_heads: u32,
+    d_state: u32,
+    head_dim: u32,
+) {
+    let h = index_1d();
+    if h >= n_heads {
+        return;
+    }
+    let d = d_state as usize;
+    let hd = head_dim as usize;
+    let base_state = (h as usize) * d * d;
+    let base_qkv = (h as usize) * d;
+    let base_v = (h as usize) * hd;
+
+    let q_h = q.add(base_qkv);
+    let k_h = k.add(base_qkv);
+    let v_h = v.add(base_v);
+    let g_val = *g.add(h as usize);
+    let b_val = *beta.add(h as usize);
+    let g_exp = expf(g_val);
+
+    // decay: S *= exp(g)
+    let mut idx = 0usize;
+    while idx < d * d {
+        *state.add(base_state + idx) *= g_exp;
+        idx += 1;
+    }
+
+    // sk = S @ k  [d]
+    let mut sk = [0.0f32; 128];
+    let mut j = 0u32;
+    while j < d_state {
+        let mut sum = 0.0f32;
+        let mut i = 0u32;
+        while i < d_state {
+            sum += *state.add(base_state + (j as usize * d + i as usize)) * *k_h.add(i as usize);
+            i += 1;
+        }
+        sk[j as usize] = sum;
+        j += 1;
+    }
+
+    // S += k ⊗ ((v - sk)*beta)  — head_dim == d_state per qwen35-0.8B
+    j = 0;
+    while j < d_state {
+        let d_val = (*v_h.add(j as usize) - sk[j as usize]) * b_val;
+        let mut i = 0u32;
+        while i < d_state {
+            *state.add(base_state + (j as usize * d + i as usize)) += *k_h.add(i as usize) * d_val;
+            i += 1;
+        }
+        j += 1;
+    }
+
+    // o = S @ q
+    let out_h = out.add(base_v);
+    j = 0;
+    while j < head_dim {
+        let mut sum = 0.0f32;
+        let mut i = 0u32;
+        while i < d_state {
+            sum += *state.add(base_state + (j as usize * d + i as usize)) * *q_h.add(i as usize);
+            i += 1;
+        }
+        *out_h.add(j as usize) = sum;
+        j += 1;
+    }
 }

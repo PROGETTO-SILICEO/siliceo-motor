@@ -487,4 +487,248 @@ mod smoke {
         println!("silu_mul max_err = {max_err:.3e}");
         assert!(max_err < 1e-4, "parity silu_mul: max_err={max_err}");
     }
+
+    fn silu_inplace_cpu(x: &mut [f32]) {
+        for v in x.iter_mut() {
+            *v = *v / (1.0 + (-*v).exp());
+        }
+    }
+
+    fn l2norm_per_head_cpu(x: &mut [f32], n_heads: usize, d_state: usize) {
+        for h in 0..n_heads {
+            let base = h * d_state;
+            let mut ss = 0.0f32;
+            for i in 0..d_state {
+                ss += x[base + i] * x[base + i];
+            }
+            let inv = 1.0 / (ss + 1e-6).sqrt();
+            for i in 0..d_state {
+                x[base + i] *= inv;
+            }
+        }
+    }
+
+    fn conv1d_depthwise_cpu(
+        conv_buf: &mut [f32],
+        qkv_mixed: &[f32],
+        conv_weight: &[f32],
+        conv_out: &mut [f32],
+        conv_k: usize,
+        conv_dim: usize,
+    ) {
+        let row = conv_dim;
+        for k in 0..conv_k - 1 {
+            for d in 0..conv_dim {
+                conv_buf[k * row + d] = conv_buf[(k + 1) * row + d];
+            }
+        }
+        for d in 0..conv_dim {
+            conv_buf[(conv_k - 1) * row + d] = qkv_mixed[d];
+        }
+        for d in 0..conv_dim {
+            let mut sum = 0.0f32;
+            for k in 0..conv_k {
+                sum += conv_weight[d * conv_k + k] * conv_buf[k * row + d];
+            }
+            conv_out[d] = sum;
+        }
+    }
+
+    fn delta_gate_cpu(alpha_dot: &[f32], dt_bias: &[f32], ssm_a: &[f32]) -> Vec<f32> {
+        alpha_dot.iter().zip(dt_bias).zip(ssm_a).map(|((&a, &b), &al)| {
+            let v = a + b;
+            let sp = if v > 20.0 { v } else { (1.0 + v.exp()).ln() };
+            -al.exp() * sp
+        }).collect()
+    }
+
+    fn delta_beta_cpu(beta_dot: &[f32]) -> Vec<f32> {
+        beta_dot.iter().map(|&v| 1.0 / (1.0 + (-v).exp())).collect()
+    }
+
+    fn delta_recurrent_step_cpu(
+        state: &mut [f32],
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        g: &[f32],
+        beta: &[f32],
+        n_heads: usize,
+        d_state: usize,
+        head_dim: usize,
+    ) -> Vec<f32> {
+        let mut out = vec![0.0f32; n_heads * head_dim];
+        for h in 0..n_heads {
+            let base_state = h * d_state * d_state;
+            let base_qkv = h * d_state;
+            let base_v = h * head_dim;
+            let g_exp = g[h].exp();
+            for idx in 0..d_state * d_state {
+                state[base_state + idx] *= g_exp;
+            }
+            let mut sk = vec![0.0f32; d_state];
+            for j in 0..d_state {
+                let mut sum = 0.0f32;
+                for i in 0..d_state {
+                    sum += state[base_state + j * d_state + i] * k[base_qkv + i];
+                }
+                sk[j] = sum;
+            }
+            for j in 0..d_state {
+                let d_val = (v[base_v + j] - sk[j]) * beta[h];
+                for i in 0..d_state {
+                    state[base_state + j * d_state + i] += k[base_qkv + i] * d_val;
+                }
+            }
+            for j in 0..head_dim {
+                let mut sum = 0.0f32;
+                for i in 0..d_state {
+                    sum += state[base_state + j * d_state + i] * q[base_qkv + i];
+                }
+                out[base_v + j] = sum;
+            }
+        }
+        out
+    }
+
+    #[test]
+    fn l2norm_per_head_parity_contro_cpu() {
+        const N_HEADS: usize = 4;
+        const D: usize = 16;
+        let gpu = Gpu::new().unwrap();
+        let func = gpu.function("l2norm_per_head_f32").unwrap();
+        let mut input = lcg_input(N_HEADS * D, 0xDE17A);
+        let mut expected = input.clone();
+        l2norm_per_head_cpu(&mut expected, N_HEADS, D);
+        let d_x = DeviceBuffer::from_slice(&input).unwrap();
+        let threads = 32u32;
+        let blocks = (N_HEADS as u32).div_ceil(threads);
+        let stream = &gpu.stream;
+        unsafe {
+            launch!(func<<<blocks, threads, 0, stream>>>(d_x.as_device_ptr(), N_HEADS as u32, D as u32))
+                .map_err(|e| err("launch", e)).unwrap();
+        }
+        gpu.stream.synchronize().unwrap();
+        let mut got = vec![0.0f32; N_HEADS * D];
+        d_x.copy_to(&mut got).unwrap();
+        let mut max_err = 0.0f32;
+        for (g, e) in got.iter().zip(expected.iter()) {
+            max_err = max_err.max((g - e).abs());
+        }
+        println!("l2norm_per_head max_err = {max_err:.3e}");
+        assert!(max_err < 1e-5, "parity l2norm_per_head: {max_err}");
+    }
+
+    #[test]
+    fn conv1d_depthwise_parity_contro_cpu() {
+        const K: usize = 4;
+        const D: usize = 32;
+        let gpu = Gpu::new().unwrap();
+        let func = gpu.function("conv1d_depthwise_f32").unwrap();
+        let mut conv_buf = lcg_input(K * D, 0xC0DE);
+        // scale conv_buf small
+        for v in conv_buf.iter_mut() { *v *= 0.5; }
+        let qkv = lcg_input(D, 0x1234);
+        let weight = lcg_input(D * K, 0x5678);
+        let mut expected_buf = conv_buf.clone();
+        let mut expected_out = vec![0.0f32; D];
+        conv1d_depthwise_cpu(&mut expected_buf, &qkv, &weight, &mut expected_out, K, D);
+        let d_buf = DeviceBuffer::from_slice(&conv_buf).unwrap();
+        let d_qkv = DeviceBuffer::from_slice(&qkv).unwrap();
+        let d_w = DeviceBuffer::from_slice(&weight).unwrap();
+        let d_out = DeviceBuffer::<f32>::zeroed(D).unwrap();
+        let stream = &gpu.stream;
+        unsafe {
+            launch!(func<<<D as u32, 256, 0, stream>>>(d_buf.as_device_ptr(), d_qkv.as_device_ptr(), d_w.as_device_ptr(), d_out.as_device_ptr(), K as u32, D as u32))
+                .map_err(|e| err("launch", e)).unwrap();
+        }
+        gpu.stream.synchronize().unwrap();
+        let mut got_buf = vec![0.0f32; K * D];
+        d_buf.copy_to(&mut got_buf).unwrap();
+        let mut got_out = vec![0.0f32; D];
+        d_out.copy_to(&mut got_out).unwrap();
+        let mut max_err = 0.0f32;
+        for (g, e) in got_buf.iter().zip(expected_buf.iter()) {
+            max_err = max_err.max((g - e).abs());
+        }
+        for (g, e) in got_out.iter().zip(expected_out.iter()) {
+            max_err = max_err.max((g - e).abs());
+        }
+        println!("conv1d max_err = {max_err:.3e}");
+        assert!(max_err < 1e-5, "parity conv1d: {max_err}");
+    }
+
+    #[test]
+    fn delta_gate_beta_parity_contro_cpu() {
+        const H: usize = 16;
+        let gpu = Gpu::new().unwrap();
+        let f_gate = gpu.function("delta_gate_f32").unwrap();
+        let f_beta = gpu.function("delta_beta_f32").unwrap();
+        let alpha_dot = lcg_input(H, 0xAAA);
+        let dt_bias = lcg_input(H, 0xBBB);
+        let ssm_a = lcg_input(H, 0xCCC);
+        let beta_dot = lcg_input(H, 0xDDD);
+        let expected_gate = delta_gate_cpu(&alpha_dot, &dt_bias, &ssm_a);
+        let expected_beta = delta_beta_cpu(&beta_dot);
+        let d_alpha = DeviceBuffer::from_slice(&alpha_dot).unwrap();
+        let d_bias = DeviceBuffer::from_slice(&dt_bias).unwrap();
+        let d_a = DeviceBuffer::from_slice(&ssm_a).unwrap();
+        let d_g = DeviceBuffer::<f32>::zeroed(H).unwrap();
+        let d_bdot = DeviceBuffer::from_slice(&beta_dot).unwrap();
+        let d_b = DeviceBuffer::<f32>::zeroed(H).unwrap();
+        let stream = &gpu.stream;
+        unsafe {
+            launch!(f_gate<<<1, 32, 0, stream>>>(d_alpha.as_device_ptr(), d_bias.as_device_ptr(), d_a.as_device_ptr(), d_g.as_device_ptr(), H as u32)).unwrap();
+            launch!(f_beta<<<1, 32, 0, stream>>>(d_bdot.as_device_ptr(), d_b.as_device_ptr(), H as u32)).unwrap();
+        }
+        gpu.stream.synchronize().unwrap();
+        let mut got_gate = vec![0.0f32; H];
+        d_g.copy_to(&mut got_gate).unwrap();
+        let mut got_beta = vec![0.0f32; H];
+        d_b.copy_to(&mut got_beta).unwrap();
+        let mut max_err: f32 = 0.0;
+        for (g, e) in got_gate.iter().zip(expected_gate.iter()) { max_err = max_err.max((g - e).abs()); }
+        for (g, e) in got_beta.iter().zip(expected_beta.iter()) { max_err = max_err.max((g - e).abs()); }
+        println!("delta gate/beta max_err = {max_err:.3e}");
+        assert!(max_err < 1e-5, "parity gate/beta: {max_err}");
+    }
+
+    #[test]
+    fn delta_recurrent_step_parity_contro_cpu() {
+        const H: usize = 4;
+        const D: usize = 8;
+        const HD: usize = 8;
+        let gpu = Gpu::new().unwrap();
+        let func = gpu.function("delta_recurrent_step_f32").unwrap();
+        let mut state = lcg_input(H * D * D, 0x1111);
+        for v in state.iter_mut() { *v *= 0.1; }
+        let q = lcg_input(H * D, 0x2222);
+        let k = lcg_input(H * D, 0x3333);
+        let v = lcg_input(H * HD, 0x4444);
+        let g = lcg_input(H, 0x5555).iter().map(|&x| x * 0.5 - 1.0).collect::<Vec<_>>();
+        let beta = lcg_input(H, 0x6666).iter().map(|&x| 1.0/(1.0+(-x).exp())).collect::<Vec<_>>();
+        let mut expected_state = state.clone();
+        let expected_out = delta_recurrent_step_cpu(&mut expected_state, &q, &k, &v, &g, &beta, H, D, HD);
+        let d_state = DeviceBuffer::from_slice(&state).unwrap();
+        let d_q = DeviceBuffer::from_slice(&q).unwrap();
+        let d_k = DeviceBuffer::from_slice(&k).unwrap();
+        let d_v = DeviceBuffer::from_slice(&v).unwrap();
+        let d_g = DeviceBuffer::from_slice(&g).unwrap();
+        let d_beta = DeviceBuffer::from_slice(&beta).unwrap();
+        let d_out = DeviceBuffer::<f32>::zeroed(H * HD).unwrap();
+        let stream = &gpu.stream;
+        unsafe {
+            launch!(func<<<H as u32, 32, 0, stream>>>(d_state.as_device_ptr(), d_q.as_device_ptr(), d_k.as_device_ptr(), d_v.as_device_ptr(), d_g.as_device_ptr(), d_beta.as_device_ptr(), d_out.as_device_ptr(), H as u32, D as u32, HD as u32)).unwrap();
+        }
+        gpu.stream.synchronize().unwrap();
+        let mut got_state = vec![0.0f32; H * D * D];
+        d_state.copy_to(&mut got_state).unwrap();
+        let mut got_out = vec![0.0f32; H * HD];
+        d_out.copy_to(&mut got_out).unwrap();
+        let mut max_err: f32 = 0.0;
+        for (g, e) in got_state.iter().zip(expected_state.iter()) { max_err = max_err.max((g - e).abs()); }
+        for (g, e) in got_out.iter().zip(expected_out.iter()) { max_err = max_err.max((g - e).abs()); }
+        println!("delta recurrent max_err = {max_err:.3e}");
+        assert!(max_err < 1e-4, "parity delta recurrent: {max_err}");
+    }
 }
