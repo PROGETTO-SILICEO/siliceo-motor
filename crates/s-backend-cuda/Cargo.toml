@@ -7,6 +7,7 @@ authors.workspace = true
 
 [dependencies]
 s-models = { path = "../s-models" }
+s-gguf = { path = "../s-gguf" }
 # Dipendenza CUDA SOLO dietro feature: il workspace compila ovunque senza
 # driver/toolkit NVIDIA (CI, macchine CPU, repo pubblica). cust richiede
 # libcuda a link-time → mai dipendenza di default finché non serve.

@@ -8,6 +8,7 @@
 use crate::runtime::{CudaCtx, err};
 use cust::memory::{CopyDestination, DeviceBuffer, DevicePointer};
 use cust::module::Module;
+use s_gguf::GgufFile;
 use s_models::qwen35::{Config, Model, Qwen35LayerView};
 
 const CUBIN: &[u8] = include_bytes!(concat!(env!("OUT_DIR"), "/kernels.cubin"));
@@ -51,32 +52,32 @@ impl GpuCore {
 
 struct GpuDeltaNetLayer {
     attn_norm: DeviceBuffer<f32>,
-    qkv: DeviceBuffer<f32>,
-    gate: DeviceBuffer<f32>,
+    qkv: GpuWeight,
+    gate: GpuWeight,
     conv1d: DeviceBuffer<f32>,
     dt_bias: DeviceBuffer<f32>,
     ssm_a: DeviceBuffer<f32>,
     alpha: DeviceBuffer<f32>,
     beta: DeviceBuffer<f32>,
     ssm_norm: DeviceBuffer<f32>, // expanded to n_heads*hd (2048) if needed
-    ssm_out: DeviceBuffer<f32>,
+    ssm_out: GpuWeight,
     post_norm: DeviceBuffer<f32>,
-    ffn_gate: DeviceBuffer<f32>,
-    ffn_up: DeviceBuffer<f32>,
-    ffn_down: DeviceBuffer<f32>,
+    ffn_gate: GpuWeight,
+    ffn_up: GpuWeight,
+    ffn_down: GpuWeight,
 }
 struct GpuAttentionLayer35 {
     attn_norm: DeviceBuffer<f32>,
-    wq: DeviceBuffer<f32>,
-    wk: DeviceBuffer<f32>,
-    wv: DeviceBuffer<f32>,
-    wo: DeviceBuffer<f32>,
+    wq: GpuWeight,
+    wk: GpuWeight,
+    wv: GpuWeight,
+    wo: GpuWeight,
     q_norm: DeviceBuffer<f32>, // expanded
     k_norm: DeviceBuffer<f32>,
     post_norm: DeviceBuffer<f32>,
-    ffn_gate: DeviceBuffer<f32>,
-    ffn_up: DeviceBuffer<f32>,
-    ffn_down: DeviceBuffer<f32>,
+    ffn_gate: GpuWeight,
+    ffn_up: GpuWeight,
+    ffn_down: GpuWeight,
 }
 enum GpuLayer35 { DeltaNet(GpuDeltaNetLayer), Attention(GpuAttentionLayer35) }
 
@@ -122,6 +123,81 @@ pub struct GpuQwen35 {
 }
 
 fn up(data: &[f32]) -> Result<DeviceBuffer<f32>, String> { DeviceBuffer::from_slice(data).map_err(|e| err("upload", e)) }
+fn up_u8(data: &[u8]) -> Result<DeviceBuffer<u8>, String> { DeviceBuffer::from_slice(data).map_err(|e| err("upload", e)) }
+
+/// Peso su GPU: o f32 denso o quantizzato compresso (fused dequant-matmul)
+enum GpuWeight {
+    F32(DeviceBuffer<f32>),
+    Q80(DeviceBuffer<u8>),
+    Q4K(DeviceBuffer<u8>),
+    Q6K(DeviceBuffer<u8>),
+    Q5K(DeviceBuffer<u8>),
+}
+impl GpuWeight {
+    fn from_raw(raw: &[u8], ty: s_gguf::types::GgmlType) -> Result<Self, String> {
+        use s_gguf::types::GgmlType as T;
+        match ty {
+            T::F32 => {
+                if raw.len() % 4 != 0 { return Err("F32 raw len %4".into()); }
+                let mut v = Vec::with_capacity(raw.len()/4);
+                for c in raw.chunks_exact(4) { v.push(f32::from_le_bytes([c[0],c[1],c[2],c[3]])); }
+                Ok(Self::F32(up(&v)?))
+            },
+            T::F16 => {
+                if raw.len() % 2 != 0 { return Err("F16 raw len".into()); }
+                let mut v = Vec::with_capacity(raw.len()/2);
+                for c in raw.chunks_exact(2) {
+                    let h = c[0] as u16 | ((c[1] as u16)<<8);
+                    let f = s_gguf::dequant::fp16_to_f32(h);
+                    v.push(f);
+                }
+                Ok(Self::F32(up(&v)?))
+            },
+            T::Bf16 => {
+                let mut v = Vec::with_capacity(raw.len()/2);
+                for c in raw.chunks_exact(2) {
+                    let h = c[0] as u16 | ((c[1] as u16)<<8);
+                    v.push(s_gguf::dequant::bf16_to_f32(h));
+                }
+                Ok(Self::F32(up(&v)?))
+            },
+            T::Q8_0 => Ok(Self::Q80(up_u8(raw)?)),
+            T::Q4K => Ok(Self::Q4K(up_u8(raw)?)),
+            T::Q6K => Ok(Self::Q6K(up_u8(raw)?)),
+            T::Q5K => Ok(Self::Q5K(up_u8(raw)?)),
+            // altri tipi: dequantizza a f32 come fallback (non compressi)
+            _ => {
+                // fallback: usa s-gguf dequantize generica
+                // Costruiamo TensorInfo fittizio per chiamare dequantize — più semplice: apriamo via GgufFile API già dequantizzata
+                // Ma qui abbiamo già raw + ty, usiamo s_gguf::dequant::dequantize se disponibile
+                // Per ora errore esplicito
+                Err(format!("GpuWeight: tipo {:?} non supportato on-device, usa F16", ty))
+            }
+        }
+    }
+    fn launch_matmul(&self, core: &GpuCore, x: DevicePointer<f32>, y: DevicePointer<f32>, seq: u32, n_out: u32, n_in: u32) -> Result<(), String> {
+        let stream = &core.stream;
+        match self {
+            Self::F32(buf) => {
+                launch_simple!(core.function("matmul_wt_f32"), stream, grid_for(seq as usize * n_out as usize,256),256, x, buf.as_device_ptr(), y, seq, n_out, n_in);
+            },
+            Self::Q80(buf) => {
+                launch_simple!(core.function("matmul_q8_0_f32"), stream, grid_for(seq as usize * n_out as usize,256),256, x, buf.as_device_ptr(), y, seq, n_out, n_in);
+            },
+            Self::Q4K(buf) => {
+                launch_simple!(core.function("matmul_q4_k_f32"), stream, grid_for(seq as usize * n_out as usize,256),256, x, buf.as_device_ptr(), y, seq, n_out, n_in);
+            },
+            Self::Q6K(buf) => {
+                launch_simple!(core.function("matmul_q6_k_f32"), stream, grid_for(seq as usize * n_out as usize,256),256, x, buf.as_device_ptr(), y, seq, n_out, n_in);
+            },
+            Self::Q5K(buf) => {
+                launch_simple!(core.function("matmul_q5_k_f32"), stream, grid_for(seq as usize * n_out as usize,256),256, x, buf.as_device_ptr(), y, seq, n_out, n_in);
+            },
+        }
+        Ok(())
+    }
+}
+
 fn up_expanded(data: &[f32], hd: usize, n_heads: usize) -> Result<DeviceBuffer<f32>, String> {
     if data.len() == hd * n_heads { return up(data); }
     if data.len() == hd {
@@ -156,19 +232,19 @@ impl GpuQwen35 {
                 Qwen35LayerView::DeltaNet(dn) => {
                     layers.push(GpuLayer35::DeltaNet(GpuDeltaNetLayer{
                         attn_norm: up(dn.attn_norm)?,
-                        qkv: up(dn.qkv)?,
-                        gate: up(dn.gate)?,
+                        qkv: GpuWeight::F32(up(dn.qkv)?),
+                        gate: GpuWeight::F32(up(dn.gate)?),
                         conv1d: up(dn.conv1d)?,
                         dt_bias: up(dn.dt_bias)?,
                         ssm_a: up(dn.ssm_a)?,
                         alpha: up(dn.alpha)?,
                         beta: up(dn.beta)?,
                         ssm_norm: up_expanded(dn.ssm_norm, 128, n_heads)?,
-                        ssm_out: up(dn.ssm_out)?,
+                        ssm_out: GpuWeight::F32(up(dn.ssm_out)?),
                         post_norm: up(dn.post_norm)?,
-                        ffn_gate: up(dn.ffn_gate)?,
-                        ffn_up: up(dn.ffn_up)?,
-                        ffn_down: up(dn.ffn_down)?,
+                        ffn_gate: GpuWeight::F32(up(dn.ffn_gate)?),
+                        ffn_up: GpuWeight::F32(up(dn.ffn_up)?),
+                        ffn_down: GpuWeight::F32(up(dn.ffn_down)?),
                     }));
                     states.push(zero_f(d_state * d_state * n_heads)?);
                     conv_bufs.push(zero_f(config.ssm_d_conv * conv_dim)?);
@@ -178,16 +254,16 @@ impl GpuQwen35 {
                 Qwen35LayerView::Attention(at) => {
                     layers.push(GpuLayer35::Attention(GpuAttentionLayer35{
                         attn_norm: up(at.attn_norm)?,
-                        wq: up(at.wq)?,
-                        wk: up(at.wk)?,
-                        wv: up(at.wv)?,
-                        wo: up(at.wo)?,
+                        wq: GpuWeight::F32(up(at.wq)?),
+                        wk: GpuWeight::F32(up(at.wk)?),
+                        wv: GpuWeight::F32(up(at.wv)?),
+                        wo: GpuWeight::F32(up(at.wo)?),
                         q_norm: up_expanded(at.q_norm, config.head_dim, config.n_heads)?,
                         k_norm: up_expanded(at.k_norm, config.head_dim, config.n_kv_heads)?,
                         post_norm: up(at.post_norm)?,
-                        ffn_gate: up(at.ffn_gate)?,
-                        ffn_up: up(at.ffn_up)?,
-                        ffn_down: up(at.ffn_down)?,
+                        ffn_gate: GpuWeight::F32(up(at.ffn_gate)?),
+                        ffn_up: GpuWeight::F32(up(at.ffn_up)?),
+                        ffn_down: GpuWeight::F32(up(at.ffn_down)?),
                     }));
                     states.push(zero_f(1)?);
                     conv_bufs.push(zero_f(1)?);
@@ -208,6 +284,127 @@ impl GpuQwen35 {
             output_norm_dev: up(views.output_norm)?,
             output_norm_host: views.output_norm.to_vec(),
             output_head_host: views.output.to_vec(),
+            layers, states, conv_bufs, k_caches, v_caches,
+            max_seq,
+            x: zero_f(max_seq * ne)?,
+            normed: zero_f(max_seq * ne)?,
+            q_full: zero_f(max_seq * q_full_dim)?,
+            q_buf: zero_f(max_seq * q_dim)?,
+            gate_buf: zero_f(max_seq * q_dim)?,
+            k_new: zero_f(max_seq * kv_dim)?,
+            v_new: zero_f(max_seq * kv_dim)?,
+            attn_out: zero_f(max_seq * q_dim)?,
+            scores: zero_f(scores_elems)?,
+            tmp1: zero_f(max_seq * n_ff.max(ne))?,
+            tmp2: zero_f(max_seq * n_ff.max(ne))?,
+            ffn_act: zero_f(max_seq * n_ff)?,
+            delta_qkv: zero_f(conv_dim)?,
+            delta_conv_out: zero_f(conv_dim)?,
+            delta_z: zero_f(value_dim)?,
+            delta_alpha_dot: zero_f(n_heads)?,
+            delta_beta_dot: zero_f(n_heads)?,
+            delta_g: zero_f(n_heads)?,
+            delta_beta: zero_f(n_heads)?,
+            delta_out: zero_f(value_dim)?,
+            last_hidden: zero_f(ne)?,
+            config,
+        })
+    }
+
+    /// Caricamento quantizzato on-device: legge GGUF Q4_K_M/Q8_0 direttamente
+    /// e tiene i pesi compressi in VRAM (GpuWeight). Norms/bias restano F32.
+    pub fn load_quantized(path: impl AsRef<std::path::Path>, max_seq: usize) -> Result<Self, String> {
+        let mut gguf = GgufFile::open(&path).map_err(|e| format!("gguf open: {e}"))?;
+        let config = Config::from_gguf(&gguf).map_err(|e| format!("config: {e}"))?;
+        let ne = config.n_embd;
+        let kv_dim = config.n_kv_heads * config.head_dim;
+        let key_dim = config.ssm_d_state * config.ssm_n_group;
+        let value_dim = config.ssm_d_state * config.ssm_dt_rank;
+        let conv_dim = key_dim * 2 + value_dim;
+        let d_state = config.ssm_d_state;
+        let n_heads = config.ssm_dt_rank;
+        let core = GpuCore::new()?;
+        let zero_f = |n: usize| -> Result<DeviceBuffer<f32>, String> { DeviceBuffer::zeroed(n).map_err(|e| err("alloc", e)) };
+
+        // helper: carica peso come GpuWeight (quantizzato se Q4K/Q6K/Q8/Q5K, altrimenti F32)
+        let load_weight = |gg: &mut GgufFile, name: &str| -> Result<GpuWeight, String> {
+            let info = gg.tensor(name).map_err(|e| format!("{name}: {e}"))?;
+            let ty = info.ggml_type;
+            let raw = gg.tensor_data_raw(name).map_err(|e| format!("{name} raw: {e}"))?;
+            GpuWeight::from_raw(&raw, ty)
+        };
+        let load_f32 = |gg: &mut GgufFile, name: &str| -> Result<Vec<f32>, String> {
+            gg.tensor_data_f32(name).map_err(|e| format!("{name}: {e}"))
+        };
+
+        // tok_embd e output: dequantizza a F32 per gather semplice
+        let tok_embd_f = load_f32(&mut gguf, "token_embd.weight")?;
+        let output_f = match gguf.tensor("output.weight") {
+            Ok(_) => load_f32(&mut gguf, "output.weight")?,
+            Err(_) => tok_embd_f.clone(),
+        };
+        let output_norm_f = load_f32(&mut gguf, "output_norm.weight")?;
+
+        let mut layers = Vec::with_capacity(config.n_layers);
+        let mut states = Vec::with_capacity(config.n_layers);
+        let mut conv_bufs = Vec::with_capacity(config.n_layers);
+        let mut k_caches = Vec::with_capacity(config.n_layers);
+        let mut v_caches = Vec::with_capacity(config.n_layers);
+
+        for i in 0..config.n_layers {
+            if config.is_recurrent(i) {
+                let attn_norm = up(&load_f32(&mut gguf, &format!("blk.{i}.attn_norm.weight"))?)?;
+                let qkv = load_weight(&mut gguf, &format!("blk.{i}.attn_qkv.weight"))?;
+                let gate = load_weight(&mut gguf, &format!("blk.{i}.attn_gate.weight"))?;
+                let conv1d = up(&load_f32(&mut gguf, &format!("blk.{i}.ssm_conv1d.weight"))?)?;
+                let dt_bias = up(&load_f32(&mut gguf, &format!("blk.{i}.ssm_dt.bias"))?)?;
+                let ssm_a = up(&load_f32(&mut gguf, &format!("blk.{i}.ssm_a"))?)?;
+                let alpha = up(&load_f32(&mut gguf, &format!("blk.{i}.ssm_alpha.weight"))?)?;
+                let beta = up(&load_f32(&mut gguf, &format!("blk.{i}.ssm_beta.weight"))?)?;
+                let ssm_norm_raw = load_f32(&mut gguf, &format!("blk.{i}.ssm_norm.weight"))?;
+                let ssm_norm = up_expanded(&ssm_norm_raw, 128, n_heads)?;
+                let ssm_out = load_weight(&mut gguf, &format!("blk.{i}.ssm_out.weight"))?;
+                let post_norm = up(&load_f32(&mut gguf, &format!("blk.{i}.post_attention_norm.weight"))?)?;
+                let ffn_gate = load_weight(&mut gguf, &format!("blk.{i}.ffn_gate.weight"))?;
+                let ffn_up = load_weight(&mut gguf, &format!("blk.{i}.ffn_up.weight"))?;
+                let ffn_down = load_weight(&mut gguf, &format!("blk.{i}.ffn_down.weight"))?;
+                layers.push(GpuLayer35::DeltaNet(GpuDeltaNetLayer{ attn_norm, qkv, gate, conv1d, dt_bias, ssm_a, alpha, beta, ssm_norm, ssm_out, post_norm, ffn_gate, ffn_up, ffn_down }));
+                states.push(zero_f(d_state * d_state * n_heads)?);
+                conv_bufs.push(zero_f(config.ssm_d_conv * conv_dim)?);
+                k_caches.push(zero_f(1)?);
+                v_caches.push(zero_f(1)?);
+            } else {
+                let attn_norm = up(&load_f32(&mut gguf, &format!("blk.{i}.attn_norm.weight"))?)?;
+                let wq = load_weight(&mut gguf, &format!("blk.{i}.attn_q.weight"))?;
+                let wk = load_weight(&mut gguf, &format!("blk.{i}.attn_k.weight"))?;
+                let wv = load_weight(&mut gguf, &format!("blk.{i}.attn_v.weight"))?;
+                let wo = load_weight(&mut gguf, &format!("blk.{i}.attn_output.weight"))?;
+                let q_norm_raw = load_f32(&mut gguf, &format!("blk.{i}.attn_q_norm.weight"))?;
+                let q_norm = up_expanded(&q_norm_raw, config.head_dim, config.n_heads)?;
+                let k_norm_raw = load_f32(&mut gguf, &format!("blk.{i}.attn_k_norm.weight"))?;
+                let k_norm = up_expanded(&k_norm_raw, config.head_dim, config.n_kv_heads)?;
+                let post_norm = up(&load_f32(&mut gguf, &format!("blk.{i}.post_attention_norm.weight"))?)?;
+                let ffn_gate = load_weight(&mut gguf, &format!("blk.{i}.ffn_gate.weight"))?;
+                let ffn_up = load_weight(&mut gguf, &format!("blk.{i}.ffn_up.weight"))?;
+                let ffn_down = load_weight(&mut gguf, &format!("blk.{i}.ffn_down.weight"))?;
+                layers.push(GpuLayer35::Attention(GpuAttentionLayer35{ attn_norm, wq, wk, wv, wo, q_norm, k_norm, post_norm, ffn_gate, ffn_up, ffn_down }));
+                states.push(zero_f(1)?);
+                conv_bufs.push(zero_f(1)?);
+                k_caches.push(zero_f(max_seq * kv_dim)?);
+                v_caches.push(zero_f(max_seq * kv_dim)?);
+            }
+        }
+        let n_ff = config.n_ff;
+        let q_dim = config.n_heads * config.head_dim;
+        let q_full_dim = q_dim * 2;
+        let scores_elems = max_seq * max_seq * config.n_heads;
+        Ok(Self{
+            core,
+            tok_embd: up(&tok_embd_f)?,
+            output_head_dev: up(&output_f)?,
+            output_norm_dev: up(&output_norm_f)?,
+            output_norm_host: output_norm_f,
+            output_head_host: output_f,
             layers, states, conv_bufs, k_caches, v_caches,
             max_seq,
             x: zero_f(max_seq * ne)?,
@@ -286,9 +483,9 @@ impl GpuQwen35 {
                         let normed_ptr = ptr_off(self.normed.as_device_ptr(), s*ne);
                         // 1 rmsnorm 1xne
                         launch_simple!(self.core.function("rmsnorm_f32"), stream, 1,64, x_ptr, dn.attn_norm.as_device_ptr(), normed_ptr, 1, ne as u32, c.rms_eps);
-                        // 2 qkv & gate matmuls seq=1
-                        launch_simple!(self.core.function("matmul_wt_f32"), stream, grid_for(conv_dim,256),256, normed_ptr, dn.qkv.as_device_ptr(), self.delta_qkv.as_device_ptr(), 1, conv_dim as u32, ne as u32);
-                        launch_simple!(self.core.function("matmul_wt_f32"), stream, grid_for(value_dim,256),256, normed_ptr, dn.gate.as_device_ptr(), self.delta_z.as_device_ptr(), 1, value_dim as u32, ne as u32);
+                        // 2 qkv & gate matmuls seq=1 (fused dequant if compressi)
+                        dn.qkv.launch_matmul(&self.core, normed_ptr, self.delta_qkv.as_device_ptr(), 1, conv_dim as u32, ne as u32)?;
+                        dn.gate.launch_matmul(&self.core, normed_ptr, self.delta_z.as_device_ptr(), 1, value_dim as u32, ne as u32)?;
                         // 3 conv1d depthwise
                         launch_simple!(self.core.function("conv1d_depthwise_f32"), stream, grid_for(conv_dim,256),256, self.conv_bufs[li].as_device_ptr(), self.delta_qkv.as_device_ptr(), dn.conv1d.as_device_ptr(), self.delta_conv_out.as_device_ptr(), conv_k as u32, conv_dim as u32);
                         // 4 silu inplace
@@ -314,7 +511,7 @@ impl GpuQwen35 {
                         // 9 ssm_out matmul -> tmp
                         // Use tmp1 as single token output [ne]
                         let tmp_ptr = self.tmp1.as_device_ptr();
-                        launch_simple!(self.core.function("matmul_wt_f32"), stream, grid_for(ne,256),256, self.delta_out.as_device_ptr(), dn.ssm_out.as_device_ptr(), tmp_ptr, 1, ne as u32, value_dim as u32);
+                        dn.ssm_out.launch_matmul(&self.core, self.delta_out.as_device_ptr(), tmp_ptr, 1, ne as u32, value_dim as u32)?;
                         // 10 residual add x += tmp
                         launch_simple!(self.core.function("vec_add_f32"), stream, grid_for(ne,256),256, x_ptr, tmp_ptr, x_ptr, ne as u32);
                         // 11 post_norm + FFN per token
@@ -327,10 +524,10 @@ impl GpuQwen35 {
                         // gate & up
                         let gate_ptr = self.tmp1.as_device_ptr(); // reuse tmp1 for gate [n_ff]
                         let up_ptr = ptr_off(self.tmp2.as_device_ptr(), ne); // offset after post_normed
-                        launch_simple!(self.core.function("matmul_wt_f32"), stream, grid_for(n_ff,256),256, post_normed_ptr, dn.ffn_gate.as_device_ptr(), gate_ptr, 1, n_ff as u32, ne as u32);
-                        launch_simple!(self.core.function("matmul_wt_f32"), stream, grid_for(n_ff,256),256, post_normed_ptr, dn.ffn_up.as_device_ptr(), up_ptr, 1, n_ff as u32, ne as u32);
+                        dn.ffn_gate.launch_matmul(&self.core, post_normed_ptr, gate_ptr, 1, n_ff as u32, ne as u32)?;
+                        dn.ffn_up.launch_matmul(&self.core, post_normed_ptr, up_ptr, 1, n_ff as u32, ne as u32)?;
                         launch_simple!(self.core.function("silu_mul_f32"), stream, grid_for(n_ff,256),256, gate_ptr, up_ptr, self.ffn_act.as_device_ptr(), n_ff as u32);
-                        launch_simple!(self.core.function("matmul_wt_f32"), stream, grid_for(ne,256),256, self.ffn_act.as_device_ptr(), dn.ffn_down.as_device_ptr(), post_normed_ptr, 1, ne as u32, n_ff as u32);
+                        dn.ffn_down.launch_matmul(&self.core, self.ffn_act.as_device_ptr(), post_normed_ptr, 1, ne as u32, n_ff as u32)?;
                         launch_simple!(self.core.function("vec_add_f32"), stream, grid_for(ne,256),256, x_ptr, post_normed_ptr, x_ptr, ne as u32);
                     }
                 },
@@ -339,7 +536,7 @@ impl GpuQwen35 {
                     // rmsnorm
                     launch_simple!(self.core.function("rmsnorm_f32"), stream, seq as u32,64, self.x.as_device_ptr(), at.attn_norm.as_device_ptr(), self.normed.as_device_ptr(), seq as u32, ne as u32, c.rms_eps);
                     // q_full = normed @ wq^T  [seq,4096]
-                    launch_simple!(self.core.function("matmul_wt_f32"), stream, grid_for(seq*q_full_dim,256),256, self.normed.as_device_ptr(), at.wq.as_device_ptr(), self.q_full.as_device_ptr(), seq as u32, q_full_dim as u32, ne as u32);
+                    at.wq.launch_matmul(&self.core, self.normed.as_device_ptr(), self.q_full.as_device_ptr(), seq as u32, q_full_dim as u32, ne as u32)?;
                     // split q/gate
                     launch_simple!(self.core.function("split_q_gate_f32"), stream, grid_for(seq*q_dim,256),256, self.q_full.as_device_ptr(), self.q_buf.as_device_ptr(), self.gate_buf.as_device_ptr(), seq as u32);
                     // q rmsnorm per head — need per seq batched: we have kernel rmsnorm_per_head for single token (n_heads). For batched we need to loop per token or extend kernel. For now loop per token s.
@@ -348,8 +545,8 @@ impl GpuQwen35 {
                         launch_simple!(self.core.function("rmsnorm_per_head_f32"), stream, grid_for(n_heads,64),64, q_s, at.q_norm.as_device_ptr(), n_heads as u32, hd as u32, c.rms_eps);
                     }
                     // k & v matmuls
-                    launch_simple!(self.core.function("matmul_wt_f32"), stream, grid_for(seq*kv_dim,256),256, self.normed.as_device_ptr(), at.wk.as_device_ptr(), self.k_new.as_device_ptr(), seq as u32, kv_dim as u32, ne as u32);
-                    launch_simple!(self.core.function("matmul_wt_f32"), stream, grid_for(seq*kv_dim,256),256, self.normed.as_device_ptr(), at.wv.as_device_ptr(), self.v_new.as_device_ptr(), seq as u32, kv_dim as u32, ne as u32);
+                    at.wk.launch_matmul(&self.core, self.normed.as_device_ptr(), self.k_new.as_device_ptr(), seq as u32, kv_dim as u32, ne as u32)?;
+                    at.wv.launch_matmul(&self.core, self.normed.as_device_ptr(), self.v_new.as_device_ptr(), seq as u32, kv_dim as u32, ne as u32)?;
                     for s in 0..seq {
                         let k_s = ptr_off(self.k_new.as_device_ptr(), s*kv_dim);
                         launch_simple!(self.core.function("rmsnorm_per_head_f32"), stream, grid_for(n_kv_heads,64),64, k_s, at.k_norm.as_device_ptr(), n_kv_heads as u32, hd as u32, c.rms_eps);
@@ -369,14 +566,14 @@ impl GpuQwen35 {
                     // gate sigmoid mul
                     launch_simple!(self.core.function("gate_sigmoid_mul_f32"), stream, grid_for(seq*q_dim,256),256, self.attn_out.as_device_ptr(), self.gate_buf.as_device_ptr(), (seq*q_dim) as u32);
                     // wo projection + residual
-                    launch_simple!(self.core.function("matmul_wt_f32"), stream, grid_for(seq*ne,256),256, self.attn_out.as_device_ptr(), at.wo.as_device_ptr(), self.tmp1.as_device_ptr(), seq as u32, ne as u32, q_dim as u32);
+                    at.wo.launch_matmul(&self.core, self.attn_out.as_device_ptr(), self.tmp1.as_device_ptr(), seq as u32, ne as u32, q_dim as u32)?;
                     launch_simple!(self.core.function("vec_add_f32"), stream, grid_for(seq*ne,256),256, self.x.as_device_ptr(), self.tmp1.as_device_ptr(), self.x.as_device_ptr(), (seq*ne) as u32);
                     // FFN
                     launch_simple!(self.core.function("rmsnorm_f32"), stream, seq as u32,64, self.x.as_device_ptr(), at.post_norm.as_device_ptr(), self.normed.as_device_ptr(), seq as u32, ne as u32, c.rms_eps);
-                    launch_simple!(self.core.function("matmul_wt_f32"), stream, grid_for(seq*n_ff,256),256, self.normed.as_device_ptr(), at.ffn_gate.as_device_ptr(), self.tmp1.as_device_ptr(), seq as u32, n_ff as u32, ne as u32);
-                    launch_simple!(self.core.function("matmul_wt_f32"), stream, grid_for(seq*n_ff,256),256, self.normed.as_device_ptr(), at.ffn_up.as_device_ptr(), self.tmp2.as_device_ptr(), seq as u32, n_ff as u32, ne as u32);
+                    at.ffn_gate.launch_matmul(&self.core, self.normed.as_device_ptr(), self.tmp1.as_device_ptr(), seq as u32, n_ff as u32, ne as u32)?;
+                    at.ffn_up.launch_matmul(&self.core, self.normed.as_device_ptr(), self.tmp2.as_device_ptr(), seq as u32, n_ff as u32, ne as u32)?;
                     launch_simple!(self.core.function("silu_mul_f32"), stream, grid_for(seq*n_ff,256),256, self.tmp1.as_device_ptr(), self.tmp2.as_device_ptr(), self.ffn_act.as_device_ptr(), (seq*n_ff) as u32);
-                    launch_simple!(self.core.function("matmul_wt_f32"), stream, grid_for(seq*ne,256),256, self.ffn_act.as_device_ptr(), at.ffn_down.as_device_ptr(), self.tmp2.as_device_ptr(), seq as u32, ne as u32, n_ff as u32);
+                    at.ffn_down.launch_matmul(&self.core, self.ffn_act.as_device_ptr(), self.tmp2.as_device_ptr(), seq as u32, ne as u32, n_ff as u32)?;
                     launch_simple!(self.core.function("vec_add_f32"), stream, grid_for(seq*ne,256),256, self.x.as_device_ptr(), self.tmp2.as_device_ptr(), self.x.as_device_ptr(), (seq*ne) as u32);
                 }
             }
