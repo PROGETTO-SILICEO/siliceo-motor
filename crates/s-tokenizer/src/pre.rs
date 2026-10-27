@@ -24,12 +24,14 @@ pub struct PreTokenizer {
 
 impl PreTokenizer {
     /// Regex per la famiglia indicata dal KV tokenizer.ggml.pre.
-    /// 'qwen2', 'gpt2', 'smollm' e default cadono qui ('smollm' usa la regex
-    /// GPT-2 nel suo tokenizer.json; 'llama3' ha regex propria, per ora
-    /// approssimata con questa — la parity lo dirà).
+    /// 'qwen2', 'gpt2', 'smollm', 'lfm2' e default cadono qui ('smollm' usa
+    /// la regex GPT-2 nel suo tokenizer.json; 'lfm2' dichiara nel tokenizer.json
+    /// di LiquidAI/LFM3-1.7B la stessa regex Split della famiglia GPT-2 —
+    /// verificato contro l'originale, vedi tests/pre_lfm2.rs; 'llama3' ha
+    /// regex propria, per ora approssimata con questa — la parity lo dirà).
     pub fn for_kind(kind: &str) -> std::result::Result<Self, TokenizerError> {
         let pattern = match kind {
-            "qwen2" | "qwen35" | "qwen3" | "gpt2" | "smollm" | "default" => {
+            "qwen2" | "qwen35" | "qwen3" | "gpt2" | "smollm" | "lfm2" | "default" => {
                 r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
             }
             other => return Err(TokenizerError::UnknownPre(other.to_string())),
