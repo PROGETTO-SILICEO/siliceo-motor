@@ -10,6 +10,8 @@ pub mod generate;
 pub mod qwen2;
 #[cfg(feature = "qwen35")]
 pub mod qwen35;
+#[cfg(feature = "lfm3")]
+pub mod lfm3;
 pub mod registry;
 pub mod sampling;
 pub mod state;

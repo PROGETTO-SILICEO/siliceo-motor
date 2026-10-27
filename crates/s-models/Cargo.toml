@@ -9,6 +9,8 @@ authors.workspace = true
 default = ["qwen2", "qwen35"]
 qwen2 = []
 qwen35 = []
+# F10: lfm3 (tri-hybrid). NON nei default: config+layer_kind pronti, forward assente.
+lfm3 = []
 # future: gemma = [], mistral = []
 
 [dependencies]
