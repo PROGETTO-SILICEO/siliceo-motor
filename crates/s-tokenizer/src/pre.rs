@@ -29,7 +29,7 @@ impl PreTokenizer {
     /// approssimata con questa — la parity lo dirà).
     pub fn for_kind(kind: &str) -> std::result::Result<Self, TokenizerError> {
         let pattern = match kind {
-            "qwen2" | "gpt2" | "smollm" | "default" => {
+            "qwen2" | "qwen35" | "qwen3" | "gpt2" | "smollm" | "default" => {
                 r"(?i:'s|'t|'re|'ve|'m|'ll|'d)|[^\r\n\p{L}\p{N}]?\p{L}+|\p{N}{1,3}| ?[^\s\p{L}\p{N}]+[\r\n]*|\s*[\r\n]+|\s+(?!\S)|\s+"
             }
             other => return Err(TokenizerError::UnknownPre(other.to_string())),

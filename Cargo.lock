@@ -770,6 +770,7 @@ dependencies = [
  "cuda_builder",
  "cust",
  "openssl-sys",
+ "s-gguf",
  "s-models",
 ]
 

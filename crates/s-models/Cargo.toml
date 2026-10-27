@@ -5,6 +5,12 @@ edition.workspace = true
 license.workspace = true
 authors.workspace = true
 
+[features]
+default = ["qwen2", "qwen35"]
+qwen2 = []
+qwen35 = []
+# future: gemma = [], mistral = []
+
 [dependencies]
 s-gguf = { path = "../s-gguf" }
 s-tokenizer = { path = "../s-tokenizer" }

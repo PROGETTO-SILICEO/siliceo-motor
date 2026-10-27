@@ -28,17 +28,43 @@ use s_gguf::GgufFile;
 use s_models::chat::ChatTemplate;
 use s_models::generate::GenerateParams;
 use s_models::state::SeqState;
-use s_models::Model;
+use s_models::{Famiglia, Model as Qwen2Model, Qwen35Model};
 use s_tokenizer::Tokenizer;
 use std::fmt::Write as _;
 use std::net::{TcpListener, TcpStream};
 use std::sync::{Arc, RwLock};
 
+enum ModelEnum {
+    Qwen2(Qwen2Model),
+    Qwen35(Qwen35Model),
+}
+
+impl ModelEnum {
+    fn n_layers(&self) -> usize {
+        match self {
+            Self::Qwen2(m) => m.config.n_layers,
+            Self::Qwen35(m) => m.config.n_layers,
+        }
+    }
+    fn n_embd(&self) -> usize {
+        match self {
+            Self::Qwen2(m) => m.config.n_embd,
+            Self::Qwen35(m) => m.config.n_embd,
+        }
+    }
+    fn vocab_size(&self) -> usize {
+        match self {
+            Self::Qwen2(m) => m.config.vocab_size,
+            Self::Qwen35(m) => m.config.vocab_size,
+        }
+    }
+}
+
 /// Tutto ciò che riguarda il modello CARICATO. Sostituibile a caldo:
 /// ogni richiesta prende uno snapshot (`Arc<Inner>`) e lavora su quello,
 /// quindi una richiesta in corso finisce col modello su cui è iniziata.
 struct Inner {
-    model: Model,
+    model: ModelEnum,
     tok: Tokenizer,
     model_name: String,
     /// Template di chat del modello (D6d): rilevato dal GGUF o dalla config.
@@ -72,23 +98,41 @@ impl Inner {
     /// lock di scrittura, così il server continua a servire col vecchio modello.
     fn load(model_path: &str, template_over: Option<&str>) -> Result<Arc<Self>, String> {
         let t0 = std::time::Instant::now();
-        let tok =
-            Tokenizer::from_gguf(model_path).map_err(|e| format!("tokenizer: {e}"))?;
-        let model = Model::load(model_path).map_err(|e| format!("modello: {e}"))?;
-
-        // metadata per il template di chat (riapertura leggera, solo KV)
         let gguf = GgufFile::open(model_path).map_err(|e| e.to_string())?;
         let kv_str = |key: &str| {
             gguf.metadata.iter().find(|(k, _)| k == key).and_then(|(_, v)| v.as_str())
         };
         let arch = kv_str("general.architecture").unwrap_or("sconosciuta").to_string();
+        // Detect family before loading tokenizer/model — needed for qwen35 pre-tokenizer
+        let fam = Famiglia::from_arch(&arch).unwrap_or(Famiglia::Qwen2Llama);
+        // Tokenizer: try generic, fallback for qwen35 which shares qwen2 pre-tokenizer
+        let tok = Tokenizer::from_gguf(model_path).or_else(|e| {
+            if fam == Famiglia::Qwen35 {
+                // Qwen3.5 uses same BPE as Qwen2 — retry forcing qwen2 pre-tokenizer
+                // by temporarily patching the error: try loading with qwen2 arch hint
+                // For now, surface original error with hint
+                Err(format!("{e} (qwen35 pre-tokenizer non ancora mappato, usa qwen2 compat)"))
+            } else {
+                Err(e.to_string())
+            }
+        }).map_err(|e| format!("tokenizer: {e}"))?;
+        let model = match fam {
+            Famiglia::Qwen2Llama => ModelEnum::Qwen2(
+                Qwen2Model::load(model_path).map_err(|e| format!("modello qwen2: {e}"))?
+            ),
+            Famiglia::Qwen35 => ModelEnum::Qwen35(
+                Qwen35Model::load(model_path).map_err(|e| format!("modello qwen35: {e}"))?
+            ),
+        };
+
         let chat = ChatTemplate::detect(
             &arch,
             kv_str("tokenizer.chat_template"),
             template_over,
         )?;
         eprintln!(
-            "load: arch={arch}, template={} ({})",
+            "load: arch={arch} (famiglia {:?}), template={} ({})",
+            fam,
             chat.format.name(),
             chat.source
         );
@@ -230,7 +274,7 @@ fn handle(app: &App, stream: &mut TcpStream) {
             let mut buf = String::from("{\"status\":\"ok\",\"model\":");
             write_escaped(&mut buf, &inner.model_name);
             let _ = write!(buf, ",\"layers\":{},\"embd\":{},\"chat\":\"{}\",\"tpl_from\":\"{}\"}}",
-                inner.model.config.n_layers, inner.model.config.n_embd,
+                inner.model.n_layers(), inner.model.n_embd(),
                 inner.chat.format.name(), inner.chat.source);
             respond(stream, 200, &buf);
         }
@@ -576,17 +620,15 @@ fn run_streaming_v(
         on_token(t)
     };
     let mut on_prefill = prefix_store(inner, ids);
-    let out = s_models::generate::generate_tokens_seeded(
-        &inner.model,
-        ids,
-        params,
-        &eos_all,
-        &decode,
-        &mut on_tok,
-        &mut masker,
-        prefix_seed(inner, ids, params.max_tokens),
-        &mut on_prefill,
-    );
+    let seed = prefix_seed(inner, ids, params.max_tokens);
+    let out = match &inner.model {
+        ModelEnum::Qwen2(m) => s_models::generate::generate_tokens_seeded(
+            m, ids, params, &eos_all, &decode, &mut on_tok, &mut masker, seed, &mut on_prefill,
+        ),
+        ModelEnum::Qwen35(m) => s_models::generate::generate_tokens_seeded(
+            m, ids, params, &eos_all, &decode, &mut on_tok, &mut masker, seed, &mut on_prefill,
+        ),
+    };
 
     if caduto {
         return None;
@@ -691,17 +733,15 @@ fn run_generate_con_vincolo(
     if !vincolo {
         let mut nomask = || -> Option<Vec<bool>> { None };
         let mut on_prefill = prefix_store(inner, ids);
-        return s_models::generate::generate_tokens_seeded(
-            &inner.model,
-            ids,
-            params,
-            &eos_all,
-            &decode,
-            on_token,
-            &mut nomask,
-            prefix_seed(inner, ids, params.max_tokens),
-            &mut on_prefill,
-        );
+        let seed = prefix_seed(inner, ids, params.max_tokens);
+        return match &inner.model {
+            ModelEnum::Qwen2(m) => s_models::generate::generate_tokens_seeded(
+                m, ids, params, &eos_all, &decode, on_token, &mut nomask, seed, &mut on_prefill,
+            ),
+            ModelEnum::Qwen35(m) => s_models::generate::generate_tokens_seeded(
+                m, ids, params, &eos_all, &decode, on_token, &mut nomask, seed, &mut on_prefill,
+            ),
+        };
     }
 
     let texts = inner.vocab_table();
@@ -715,17 +755,15 @@ fn run_generate_con_vincolo(
     };
     let mut mk = || -> Option<Vec<bool>> { Some(m.borrow().mask()) };
     let mut on_prefill = prefix_store(inner, ids);
-    let mut out = s_models::generate::generate_tokens_seeded(
-        &inner.model,
-        ids,
-        params,
-        &eos_all,
-        &decode,
-        &mut on_tok,
-        &mut mk,
-        prefix_seed(inner, ids, params.max_tokens),
-        &mut on_prefill,
-    );
+    let seed = prefix_seed(inner, ids, params.max_tokens);
+    let mut out = match &inner.model {
+        ModelEnum::Qwen2(m) => s_models::generate::generate_tokens_seeded(
+            m, ids, params, &eos_all, &decode, &mut on_tok, &mut mk, seed, &mut on_prefill,
+        ),
+        ModelEnum::Qwen35(m) => s_models::generate::generate_tokens_seeded(
+            m, ids, params, &eos_all, &decode, &mut on_tok, &mut mk, seed, &mut on_prefill,
+        ),
+    };
 
     // AUTO-RIPARAZIONE: se max_tokens taglia a JSON incompleto (prefisso
     // comunque legale), il suffisso minimo dallo stato dell'automa lo rende
