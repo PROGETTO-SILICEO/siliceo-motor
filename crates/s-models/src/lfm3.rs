@@ -408,6 +408,258 @@ impl Lfm3Weights {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// F10-6 — forward del blocco shortconv (SOLO il blocco).
+//
+// Formula da `Lfm3ShortConv.forward` di `LiquidAI/LFM3-1.7B`
+// (`modeling_lfm3.py`, verificata il 28/10/2026 sul sorgente ufficiale):
+//
+// ```python
+// BCx = self.in_proj(hidden_states)      # [B, T, 3*hidden]
+// B, C, x = BCx.chunk(3, dim=-1)
+// h = B * x                              # gate B PRIMA della conv, nessuna attivazione
+// h = causal_depthwise_conv(h, k=7)      # groups=hidden, padding=k-1, troncata a seq_len
+// h = C * h                              # secondo gate DOPO la conv
+// y = self.out_proj(h)
+// ```
+//
+// Quindi `out = out_proj(C * conv_k7(B * x))` con `B, C, x = chunk(in_proj(h), 3)`.
+// Config ufficiale (`config.json`): `conv_bias = False`, `conv_L_cache = 7`.
+// Buffer di decode (`causal_conv1d_update`): i valori precedenti di `B * x`
+// (l'ingresso della conv, NON l'uscita), lunghezza `l_cache - 1 = 6`.
+//
+// NON c'è qui: attenzione, MLP, embedding, `Model` completo, dispatch nel
+// server, `Famiglia::Lfm3`, CUDA. Solo il blocco.
+// ═══════════════════════════════════════════════════════════════════
+
+/// Pesi densi f32 del blocco shortconv, pronti per il forward CPU.
+///
+/// Tenuto separato da [`ShortConvWeights`] di proposito: quello è il
+/// descrittore dei tensori GGUF usato da `Lfm3Weights::load` (finestra T003,
+/// solo metadati + forme, nessuna dequantizzazione), mentre qui servono i
+/// valori. Il futuro `Model` LFM3 dequantizzerà i tensori in questo formato.
+///
+/// Layout (stesso ordine dei byte del GGUF dequantizzato, le cui dims sono
+/// `[in, out]` — vedi `matmul_row_vec` in `qwen35.rs` per la convenzione):
+/// - `in_proj`: `[3*n_embd, n_embd]` in C-order,
+///   `BCx[j] = Σ_i h[i]·in_proj[j*n_embd + i]`
+/// - `conv`: `[n_embd, l_cache]` in C-order, `conv[c*l_cache + k]` dove `k = 0`
+///   è il tap più vecchio (6 passi fa) e `k = l_cache - 1` il corrente —
+///   come `torch.einsum("bdtk,dk->bdt", windows, weight)` della reference
+/// - `out_proj`: `[n_embd, n_embd]` in C-order, stessa convenzione di `in_proj`
+#[derive(Debug, Clone)]
+pub struct ShortConvBlock {
+    pub n_embd: usize,
+    pub l_cache: usize,
+    pub in_proj: Vec<f32>,
+    pub conv: Vec<f32>,
+    pub out_proj: Vec<f32>,
+}
+
+impl ShortConvBlock {
+    /// Costruisce il blocco verificando le forme.
+    ///
+    /// Niente `unwrap` sui dati in input: ogni errore nomina il tensore,
+    /// la lunghezza attesa e quella trovata.
+    pub fn new(
+        n_embd: usize,
+        l_cache: usize,
+        in_proj: Vec<f32>,
+        conv: Vec<f32>,
+        out_proj: Vec<f32>,
+    ) -> Result<Self, String> {
+        if n_embd == 0 {
+            return Err("shortconv: n_embd deve essere > 0".into());
+        }
+        if l_cache < 2 {
+            return Err(format!(
+                "shortconv: l_cache deve essere >= 2 (storia + corrente), trovato {l_cache}"
+            ));
+        }
+        if in_proj.len() != 3 * n_embd * n_embd {
+            return Err(format!(
+                "shortconv in_proj: attesi {} elementi ([3*{n_embd}, {n_embd}]), trovati {}",
+                3 * n_embd * n_embd,
+                in_proj.len()
+            ));
+        }
+        if conv.len() != n_embd * l_cache {
+            return Err(format!(
+                "shortconv conv: attesi {} elementi ([{n_embd}, {l_cache}]), trovati {}",
+                n_embd * l_cache,
+                conv.len()
+            ));
+        }
+        if out_proj.len() != n_embd * n_embd {
+            return Err(format!(
+                "shortconv out_proj: attesi {} elementi ([{n_embd}, {n_embd}]), trovati {}",
+                n_embd * n_embd,
+                out_proj.len()
+            ));
+        }
+        Ok(Self { n_embd, l_cache, in_proj, conv, out_proj })
+    }
+
+    /// Righe di storia tenute in `conv_buf`: `l_cache - 1` (6 sul modello reale).
+    pub fn hist_rows(&self) -> usize {
+        self.l_cache - 1
+    }
+
+    /// Una posizione: `h [n_embd]` → `out [n_embd]`, aggiornando il buffer conv.
+    ///
+    /// `conv_buf` tiene le ultime `l_cache - 1` righe di `B * x` (l'ingresso
+    /// della conv, come `conv_state` in `causal_conv1d_update`): la conv legge
+    /// `[buf(6 righe)…, corrente]` col tap `k = 0` sul più vecchio, poi il
+    /// buffer avanza di una riga (scarta la più vecchia, accoda `B * x`).
+    pub fn forward_step(&self, h: &[f32], conv_buf: &mut [f32], out: &mut [f32]) {
+        let ne = self.n_embd;
+        let kk = self.l_cache;
+        let hr = self.hist_rows();
+        assert_eq!(h.len(), ne, "shortconv step: h ha {} elementi, attesi {ne}", h.len());
+        assert_eq!(
+            conv_buf.len(),
+            hr * ne,
+            "shortconv step: conv_buf ha {} elementi, attesi {}",
+            conv_buf.len(),
+            hr * ne
+        );
+        assert_eq!(
+            out.len(),
+            ne,
+            "shortconv step: out ha {} elementi, attesi {ne}",
+            out.len()
+        );
+
+        // 1. BCx = in_proj(h), poi chunk in B, C, x.
+        let mut bcx = vec![0.0f32; 3 * ne];
+        matvec(&self.in_proj, ne, 3 * ne, h, &mut bcx);
+        let (b, rest) = bcx.split_at(ne);
+        let (c, x) = rest.split_at(ne);
+
+        // 2. Gate B PRIMA della conv, nessuna attivazione (reference: `h = B * x`).
+        let mut g = vec![0.0f32; ne];
+        for i in 0..ne {
+            g[i] = b[i] * x[i];
+        }
+
+        // 3. Conv causale depthwise su [buf…, g]: tap k=0 sul più vecchio.
+        let mut cv = vec![0.0f32; ne];
+        for ci in 0..ne {
+            let mut sum = 0.0f32;
+            for k2 in 0..hr {
+                sum += self.conv[ci * kk + k2] * conv_buf[k2 * ne + ci];
+            }
+            sum += self.conv[ci * kk + hr] * g[ci];
+            cv[ci] = sum;
+        }
+
+        // 4. Gate C DOPO la conv + out_proj (reference: `y = C * hidden_states`).
+        let mut y2 = vec![0.0f32; ne];
+        for i in 0..ne {
+            y2[i] = c[i] * cv[i];
+        }
+        matvec(&self.out_proj, ne, ne, &y2, out);
+
+        // 5. Avanza la storia: scarta la riga più vecchia, accoda B * x.
+        if hr > 0 {
+            conv_buf.copy_within(ne.., 0);
+            conv_buf[(hr - 1) * ne..].copy_from_slice(&g);
+        }
+    }
+
+    /// Prefill: T posizioni in un colpo.
+    ///
+    /// `h`/`out` sono flat `[T, n_embd]` in row-major, `conv_buf` come in
+    /// [`ShortConvBlock::forward_step`]. Percorso separato dallo step
+    /// (storia locale + loop a sequenza invece di storia persistente):
+    /// l'accordo fra i due è la proprietà che serve al motore (test 2).
+    /// Alla fine `conv_buf` contiene le ultime `l_cache - 1` righe di `B * x`,
+    /// pronto per proseguire in decode.
+    pub fn forward_seq(&self, h: &[f32], t: usize, conv_buf: &mut [f32], out: &mut [f32]) {
+        let ne = self.n_embd;
+        let kk = self.l_cache;
+        let hr = self.hist_rows();
+        assert_eq!(
+            h.len(),
+            t * ne,
+            "shortconv seq: h ha {} elementi, attesi {t}*{ne}",
+            h.len()
+        );
+        assert_eq!(
+            out.len(),
+            t * ne,
+            "shortconv seq: out ha {} elementi, attesi {t}*{ne}",
+            out.len()
+        );
+        assert_eq!(
+            conv_buf.len(),
+            hr * ne,
+            "shortconv seq: conv_buf ha {} elementi, attesi {}",
+            conv_buf.len(),
+            hr * ne
+        );
+        if t == 0 {
+            return;
+        }
+
+        // Storia dei gate B*x: [buf_old (hr righe) | g_0 … g_{t-1}].
+        let mut hist = vec![0.0f32; (hr + t) * ne];
+        hist[..hr * ne].copy_from_slice(conv_buf);
+
+        for p in 0..t {
+            let hp = &h[p * ne..(p + 1) * ne];
+
+            // 1-2. in_proj + chunk + gate B (loop propri di questo percorso).
+            let mut bcx = vec![0.0f32; 3 * ne];
+            for j in 0..3 * ne {
+                let mut sum = 0.0f32;
+                for i in 0..ne {
+                    sum += hp[i] * self.in_proj[j * ne + i];
+                }
+                bcx[j] = sum;
+            }
+            for i in 0..ne {
+                hist[(hr + p) * ne + i] = bcx[i] * bcx[2 * ne + i];
+            }
+
+            // 3. Conv causale: finestra di `l_cache` righe che termina in p.
+            let mut cv = vec![0.0f32; ne];
+            for ci in 0..ne {
+                let mut sum = 0.0f32;
+                for k2 in 0..kk {
+                    sum += self.conv[ci * kk + k2] * hist[(p + k2) * ne + ci];
+                }
+                cv[ci] = sum;
+            }
+
+            // 4. Gate C + out_proj.
+            let op = &mut out[p * ne..(p + 1) * ne];
+            for j in 0..ne {
+                let mut sum = 0.0f32;
+                for i in 0..ne {
+                    sum += bcx[ne + i] * cv[i] * self.out_proj[j * ne + i];
+                }
+                op[j] = sum;
+            }
+        }
+
+        // Ultime hr righe di storia → conv_buf (decode può proseguire da qui).
+        conv_buf.copy_from_slice(&hist[t * ne..(t + hr) * ne]);
+    }
+}
+
+/// `m` in C-order `[rows, cols]`: `y[j] = Σ_i x[i]·m[j*cols + i]`.
+/// Stessa convenzione di `matmul_row_vec` in `qwen35.rs` (ordine dei byte GGUF).
+fn matvec(m: &[f32], cols: usize, rows: usize, x: &[f32], y: &mut [f32]) {
+    for j in 0..rows {
+        let mut sum = 0.0f32;
+        for i in 0..cols {
+            sum += x[i] * m[j * cols + i];
+        }
+        y[j] = sum;
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -510,5 +762,181 @@ mod tests {
         let v = GgufValue::U32(4);
         let e = parse_u_array(&v, "head_count_kv").unwrap_err();
         assert!(e.contains("atteso array"), "errore poco chiaro: {e}");
+    }
+
+    // ── F10-6: forward shortconv con dimensioni finte piccole ──
+    // n_embd = 8 (invece di 2048) così i cicli si leggono a occhio;
+    // l_cache = 7 come sul modello reale.
+    const SC_NE: usize = 8;
+    const SC_LCACHE: usize = 7;
+
+    /// LCG numerico in [-1, 1): pseudocasuale fisso, niente dipendenze.
+    fn lcg_next(s: &mut u64) -> f32 {
+        *s = s
+            .wrapping_mul(6364136223846793005)
+            .wrapping_add(1442695040888963407);
+        let bits = (*s >> 33) as u32;
+        (bits as f32) / (u32::MAX as f32) * 2.0 - 1.0
+    }
+
+    fn vec_lcg(n: usize, seed: u64) -> Vec<f32> {
+        let mut s = seed;
+        (0..n).map(|_| lcg_next(&mut s)).collect()
+    }
+
+    fn block_di_prova() -> ShortConvBlock {
+        ShortConvBlock::new(
+            SC_NE,
+            SC_LCACHE,
+            vec_lcg(3 * SC_NE * SC_NE, 0xC0_FFEE),
+            vec_lcg(SC_NE * SC_LCACHE, 0xB1_0CC0),
+            vec_lcg(SC_NE * SC_NE, 0x0B_1EC7),
+        )
+        .expect("forme di prova corrette")
+    }
+
+    fn max_diff(a: &[f32], b: &[f32]) -> f32 {
+        a.iter()
+            .zip(b.iter())
+            .map(|(x, y)| (x - y).abs())
+            .fold(0.0f32, f32::max)
+    }
+
+    #[test]
+    fn conv_contro_reference_naive() {
+        let blk = block_di_prova();
+        let ne = SC_NE;
+        let kk = SC_LCACHE;
+        let hr = kk - 1;
+        let t = 5;
+        let h = vec_lcg(t * ne, 12345);
+
+        let mut out = vec![0.0f32; t * ne];
+        let mut buf = vec![0.0f32; hr * ne];
+        blk.forward_seq(&h, t, &mut buf, &mut out);
+
+        // Reference scritta a mano nel test (cicli espliciti, nessuna
+        // funzione condivisa col codice in prova) della formula
+        // out_proj(C * conv_k7(B * x)).
+        let mut ref_out = vec![0.0f32; t * ne];
+        let mut hist = vec![0.0f32; (hr + t) * ne]; // zero-pad a sinistra
+        for p in 0..t {
+            let mut bcx = vec![0.0f32; 3 * ne];
+            for j in 0..3 * ne {
+                let mut s = 0.0f32;
+                for i in 0..ne {
+                    s += h[p * ne + i] * blk.in_proj[j * ne + i];
+                }
+                bcx[j] = s;
+            }
+            let mut g = vec![0.0f32; ne];
+            for c in 0..ne {
+                g[c] = bcx[c] * bcx[2 * ne + c];
+            }
+            hist[(hr + p) * ne..(hr + p + 1) * ne].copy_from_slice(&g);
+            let mut cv = vec![0.0f32; ne];
+            for c in 0..ne {
+                let mut s = 0.0f32;
+                for k2 in 0..kk {
+                    s += blk.conv[c * kk + k2] * hist[(p + k2) * ne + c];
+                }
+                cv[c] = s;
+            }
+            for j in 0..ne {
+                let mut s = 0.0f32;
+                for i in 0..ne {
+                    s += bcx[ne + i] * cv[i] * blk.out_proj[j * ne + i];
+                }
+                ref_out[p * ne + j] = s;
+            }
+        }
+
+        let d = max_diff(&out, &ref_out);
+        assert!(d <= 1e-5, "prefill vs reference naive: max diff {d:e} > 1e-5");
+
+        // Anche lo step singolo (buf azzerato) deve accordarsi con la
+        // posizione 0 della reference.
+        let mut out1 = vec![0.0f32; ne];
+        let mut buf1 = vec![0.0f32; hr * ne];
+        blk.forward_step(&h[..ne], &mut buf1, &mut out1);
+        let d1 = max_diff(&out1, &ref_out[..ne]);
+        assert!(d1 <= 1e-5, "step vs reference naive: max diff {d1:e} > 1e-5");
+    }
+
+    #[test]
+    fn incrementale_uguale_a_prefill() {
+        let blk = block_di_prova();
+        let ne = SC_NE;
+        let hr = SC_LCACHE - 1;
+        let t = 12;
+        let h = vec_lcg(t * ne, 777);
+
+        let mut out_seq = vec![0.0f32; t * ne];
+        let mut buf_seq = vec![0.0f32; hr * ne];
+        blk.forward_seq(&h, t, &mut buf_seq, &mut out_seq);
+
+        let mut out_step = vec![0.0f32; t * ne];
+        let mut buf_step = vec![0.0f32; hr * ne];
+        for p in 0..t {
+            let mut o = vec![0.0f32; ne];
+            blk.forward_step(&h[p * ne..(p + 1) * ne], &mut buf_step, &mut o);
+            out_step[p * ne..(p + 1) * ne].copy_from_slice(&o);
+        }
+
+        let d = max_diff(&out_seq, &out_step);
+        assert!(d <= 1e-6, "prefill vs 12 step: max diff {d:e} > 1e-6");
+        let db = max_diff(&buf_seq, &buf_step);
+        assert!(db <= 1e-6, "buf finale prefill vs step: max diff {db:e} > 1e-6");
+    }
+
+    #[test]
+    fn causalita() {
+        let blk = block_di_prova();
+        let ne = SC_NE;
+        let hr = SC_LCACHE - 1;
+        let t = 6;
+        let h = vec_lcg(t * ne, 4242);
+
+        let mut out_a = vec![0.0f32; t * ne];
+        let mut buf_a = vec![0.0f32; hr * ne];
+        blk.forward_seq(&h, t, &mut buf_a, &mut out_a);
+
+        // Cambia SOLO l'ultimo token: le uscite precedenti non devono muoversi.
+        let mut h2 = h.clone();
+        for i in 0..ne {
+            h2[(t - 1) * ne + i] += 10.0;
+        }
+        let mut out_b = vec![0.0f32; t * ne];
+        let mut buf_b = vec![0.0f32; hr * ne];
+        blk.forward_seq(&h2, t, &mut buf_b, &mut out_b);
+
+        let d_pre = max_diff(&out_a[..(t - 1) * ne], &out_b[..(t - 1) * ne]);
+        assert!(d_pre <= 1e-6, "causalità violata: le prime posizioni cambiano ({d_pre:e})");
+
+        // Sanity: l'ultima uscita DEVE cambiare (altrimenti il test è vacuo).
+        let d_last = max_diff(&out_a[(t - 1) * ne..], &out_b[(t - 1) * ne..]);
+        assert!(d_last > 1e-3, "test vacuo: l'ultimo token non influenza la sua uscita");
+    }
+
+    #[test]
+    fn stato_azzerato_riparte() {
+        let blk = block_di_prova();
+        let ne = SC_NE;
+        let hr = SC_LCACHE - 1;
+        let h3 = vec_lcg(3 * ne, 31337);
+        let mut h5 = h3.clone();
+        h5.extend(vec_lcg(2 * ne, 999));
+
+        let mut out3 = vec![0.0f32; 3 * ne];
+        let mut buf3 = vec![0.0f32; hr * ne];
+        blk.forward_seq(&h3, 3, &mut buf3, &mut out3);
+
+        let mut out5 = vec![0.0f32; 5 * ne];
+        let mut buf5 = vec![0.0f32; hr * ne];
+        blk.forward_seq(&h5, 5, &mut buf5, &mut out5);
+
+        // Con buffer azzerato i primi 3 passi non dipendono dal futuro.
+        let d = max_diff(&out3, &out5[..3 * ne]);
+        assert!(d <= 1e-6, "stato non azzerato: i primi 3 passi cambiano ({d:e})");
     }
 }
