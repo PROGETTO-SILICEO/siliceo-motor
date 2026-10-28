@@ -11,6 +11,12 @@
 //! da `PreTokenizer::for_kind("lfm2")` (famiglia GPT-2) — il test
 //! `upstream_regex_invariato` lo ricontrolla contro il file originale
 //! quando disponibile.
+//!
+//! RIVERIFICATO in modo indipendente il 28/10/2026: le tre sequenze attese qui
+//! sotto sono state ricalcolate da zero con `tokenizers` sul `tokenizer.json`
+//! in cache, invertendo ByteLevel con la tabella GPT-2 (`Ġ`→spazio, `Ċ`→`\n`,
+//! byte UTF-8 → carattere). Coincidono carattere per carattere: il test NON è
+//! circolare, non è stato adattato all'output del nostro codice.
 
 use s_tokenizer::pre::PreTokenizer;
 
