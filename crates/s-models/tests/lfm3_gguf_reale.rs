@@ -94,3 +94,61 @@ fn lfm3_gguf_reale() {
         gguf.tensors.len(),
     );
 }
+
+#[test]
+#[ignore = "richiede il GGUF ufficiale da ~1.1GB (vedi T002)"]
+fn lfm3_pesi_forme() {
+    use s_models::lfm3::{LayerKind, Lfm3Weights};
+
+    let path = gguf_path();
+    if !std::path::Path::new(&path).exists() {
+        eprintln!("SKIP: file GGUF assente ({path}) — scaricarlo come da T002");
+        return;
+    }
+
+    let gguf = s_gguf::GgufFile::open(&path)
+        .unwrap_or_else(|e| panic!("open GGUF {path}: {e}"));
+    let cfg = s_models::lfm3::Config::from_gguf(&gguf)
+        .unwrap_or_else(|e| panic!("Config::from_gguf: {e}"));
+
+    // T003: carica TUTTI i 24 layer verificando ogni forma contro l'header.
+    let w = Lfm3Weights::load(&gguf, &cfg)
+        .unwrap_or_else(|e| panic!("Lfm3Weights::load: {e}"));
+
+    assert_eq!(w.layers.len(), 24, "layer caricati");
+    let n_short = w.layers.iter().filter(|l| l.kind == LayerKind::ShortConv).count();
+    let n_attn = w.layers
+        .iter()
+        .filter(|l| l.kind == LayerKind::SlidingAttn || l.kind == LayerKind::FullAttn)
+        .count();
+    assert_eq!(n_short, 13, "shortconv attesi 13");
+    assert_eq!(n_attn, 11, "attention attesi 11");
+
+    // i 5 sliding sono esattamente gli indici 4, 8, 12, 16, 20
+    assert_eq!(w.sliding_indices(), vec![4, 8, 12, 16, 20], "sliding");
+    assert_eq!(w.kind_counts(), (13, 11, 5), "kind_counts pesi");
+
+    // coerenza pesi vs config: ogni layer ha il kind della config
+    for (li, l) in w.layers.iter().enumerate() {
+        let k = cfg.layer_kind(li).unwrap_or_else(|e| panic!("layer_kind {li}: {e}"));
+        assert_eq!(l.kind, k, "kind layer {li}");
+    }
+
+    // spot-check: una forma per famiglia contro l'header grezzo
+    let conv0 = gguf.tensor("blk.0.shortconv.conv.weight").expect("blk.0 conv");
+    assert_eq!(conv0.dims, vec![7, 2048], "blk.0 conv dims");
+    let q2 = gguf.tensor("blk.2.attn_q.weight").expect("blk.2 q");
+    assert_eq!(q2.dims, vec![2048, 2048], "blk.2 q dims");
+    let g2 = gguf.tensor("blk.2.attn_gate.weight").expect("blk.2 gate");
+    assert_eq!(g2.dims, vec![2048, 16], "blk.2 gate dims (per testa)");
+    assert_eq!(w.token_embd.dims, vec![2048, 128000], "token_embd dims");
+    assert_eq!(w.rope_freqs.dims, vec![64], "rope_freqs dims");
+
+    println!(
+        "✅ LFM3 PESI: 24 layer caricati (13 shortconv + 11 attention, sliding {:?}), \
+         287 forme verificate, 0 correzioni",
+        w.sliding_indices(),
+    );
+}
+
+

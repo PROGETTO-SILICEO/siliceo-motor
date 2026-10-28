@@ -27,7 +27,7 @@
 //! `registry::Famiglia::from_arch` finché la parity non esiste — regola del
 //! registro: "mai per speranza". Il server rifiuta `lfm3` con errore esplicito.
 
-use s_gguf::{GgufFile, GgufValue};
+use s_gguf::{GgufFile, GgufValue, TensorInfo};
 
 /// Tipo di layer nella struttura tri-hybrid.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -241,6 +241,170 @@ impl Config {
             LayerKind::SlidingAttn => Some(self.rope_theta_swa),
             LayerKind::FullAttn => Some(self.rope_theta),
         })
+    }
+}
+
+/// Pesi di un layer shortconv (gated convolution, nessuna attenzione).
+#[derive(Debug, Clone)]
+pub struct ShortConvWeights {
+    pub conv: TensorInfo,    // [l_cache, n_embd] = [7, 2048]
+    pub in_proj: TensorInfo, // [n_embd, 3*n_embd] = [2048, 6144]
+    pub out_proj: TensorInfo, // [n_embd, n_embd] = [2048, 2048]
+}
+
+/// Pesi di un layer attention (GQA + gate per testa + Q/K norm).
+#[derive(Debug, Clone)]
+pub struct AttnWeights {
+    pub q: TensorInfo,      // [n_embd, n_embd] = [2048, 2048]
+    pub k: TensorInfo,      // [n_embd, n_kv_heads*head_dim] = [2048, 512]
+    pub v: TensorInfo,      // [n_embd, n_kv_heads*head_dim] = [2048, 512]
+    pub output: TensorInfo, // [n_embd, n_embd] = [2048, 2048]
+    pub gate: TensorInfo,   // [n_embd, n_heads] = [2048, 16] (gate per testa)
+    pub q_norm: TensorInfo, // [head_dim] = [128]
+    pub k_norm: TensorInfo, // [head_dim] = [128]
+}
+
+/// Variante di layer: solo uno dei due set esiste per ogni indice.
+#[derive(Debug, Clone)]
+pub enum LayerVariant {
+    ShortConv(ShortConvWeights),
+    Attention(AttnWeights),
+}
+
+/// Pesi di un layer: 4 norm + FFN (comuni) + variante shortconv/attention.
+#[derive(Debug, Clone)]
+pub struct Lfm3LayerWeights {
+    pub kind: LayerKind,
+    pub attn_norm: TensorInfo,            // [n_embd]
+    pub post_attention_norm: TensorInfo, // [n_embd]
+    pub ffn_norm: TensorInfo,             // [n_embd]
+    pub post_ffw_norm: TensorInfo,       // [n_embd]
+    pub ffn_gate: TensorInfo,            // [n_embd, n_ff]
+    pub ffn_up: TensorInfo,              // [n_embd, n_ff]
+    pub ffn_down: TensorInfo,            // [n_ff, n_embd]
+    pub variant: LayerVariant,
+}
+
+/// Pesi LFM3 verificati contro l'header GGUF.
+///
+/// Solo metadati dei tensori (nomi + forme + tipi): nessuna dequantizzazione,
+/// nessun forward. Il forward verrà dopo (finestra successiva), su forme già
+/// garantite qui.
+#[derive(Debug, Clone)]
+pub struct Lfm3Weights {
+    pub layers: Vec<Lfm3LayerWeights>,
+    pub token_embd: TensorInfo, // [n_embd, vocab] = [2048, 128000]
+    pub output_norm: TensorInfo, // [n_embd] = [2048]
+    pub rope_freqs: TensorInfo, // [rope_n_rot/2] = [64]
+}
+
+/// Verifica che il tensore `name` esista e abbia esattamente `expected`.
+/// Ogni fallimento nomina tensore, forma attesa e forma trovata.
+fn expect_dims(gguf: &GgufFile, name: &str, expected: &[u64]) -> Result<TensorInfo, String> {
+    let info = gguf
+        .tensor(name)
+        .map_err(|e| format!("{name}: {e} (atteso {expected:?})"))?;
+    if info.dims != expected {
+        return Err(format!(
+            "{name}: forma attesa {expected:?}, trovata {:?} (tipo {:?})",
+            info.dims, info.ggml_type
+        ));
+    }
+    Ok(info.clone())
+}
+
+impl Lfm3Weights {
+    /// Carica (e verifica) tutti i pesi dal file GGUF secondo `cfg`.
+    ///
+    /// Per ogni layer sceglie il set giusto da `cfg.layer_kind(li)`:
+    /// shortconv → `shortconv.*`, attention → `attn_*`. Nessun `unwrap`:
+    /// ogni errore nomina tensore, forma attesa e forma trovata.
+    pub fn load(gguf: &GgufFile, cfg: &Config) -> Result<Self, String> {
+        let ne = cfg.n_embd as u64;
+        let nff = cfg.n_ff as u64;
+        let kv_dim = (cfg.n_kv_heads * cfg.head_dim) as u64;
+        let hd = cfg.head_dim as u64;
+        let nh = cfg.n_heads as u64;
+
+        let mut layers = Vec::with_capacity(cfg.n_layers);
+        for li in 0..cfg.n_layers {
+            let kind = cfg.layer_kind(li)?;
+            let base = format!("blk.{li}.");
+            let t = |suffix: &str, expected: &[u64]| {
+                expect_dims(gguf, &format!("{base}{suffix}"), expected)
+            };
+
+            let attn_norm = t("attn_norm.weight", &[ne])?;
+            let post_attention_norm = t("post_attention_norm.weight", &[ne])?;
+            let ffn_norm = t("ffn_norm.weight", &[ne])?;
+            let post_ffw_norm = t("post_ffw_norm.weight", &[ne])?;
+            let ffn_gate = t("ffn_gate.weight", &[ne, nff])?;
+            let ffn_up = t("ffn_up.weight", &[ne, nff])?;
+            let ffn_down = t("ffn_down.weight", &[nff, ne])?;
+
+            let variant = match kind {
+                LayerKind::ShortConv => LayerVariant::ShortConv(ShortConvWeights {
+                    conv: t("shortconv.conv.weight", &[cfg.conv_l_cache as u64, ne])?,
+                    in_proj: t("shortconv.in_proj.weight", &[ne, 3 * ne])?,
+                    out_proj: t("shortconv.out_proj.weight", &[ne, ne])?,
+                }),
+                LayerKind::SlidingAttn | LayerKind::FullAttn => {
+                    LayerVariant::Attention(AttnWeights {
+                        q: t("attn_q.weight", &[ne, ne])?,
+                        k: t("attn_k.weight", &[ne, kv_dim])?,
+                        v: t("attn_v.weight", &[ne, kv_dim])?,
+                        output: t("attn_output.weight", &[ne, ne])?,
+                        gate: t("attn_gate.weight", &[ne, nh])?,
+                        q_norm: t("attn_q_norm.weight", &[hd])?,
+                        k_norm: t("attn_k_norm.weight", &[hd])?,
+                    })
+                }
+            };
+
+            layers.push(Lfm3LayerWeights {
+                kind,
+                attn_norm,
+                post_attention_norm,
+                ffn_norm,
+                post_ffw_norm,
+                ffn_gate,
+                ffn_up,
+                ffn_down,
+                variant,
+            });
+        }
+
+        let token_embd = expect_dims(gguf, "token_embd.weight", &[ne, cfg.vocab_size as u64])?;
+        let output_norm = expect_dims(gguf, "output_norm.weight", &[ne])?;
+        let rope_freqs = expect_dims(gguf, "rope_freqs.weight", &[(cfg.rope_n_rot as u64) / 2])?;
+
+        Ok(Self { layers, token_embd, output_norm, rope_freqs })
+    }
+
+    /// Quanti layer per tipo: (shortconv, attention, sliding).
+    /// Lo sliding è un sottoinsieme di attention (finestra 256 vs globale).
+    pub fn kind_counts(&self) -> (usize, usize, usize) {
+        let mut short = 0;
+        let mut sliding = 0;
+        let mut full = 0;
+        for l in &self.layers {
+            match l.kind {
+                LayerKind::ShortConv => short += 1,
+                LayerKind::SlidingAttn => sliding += 1,
+                LayerKind::FullAttn => full += 1,
+            }
+        }
+        (short, sliding + full, sliding)
+    }
+
+    /// Indici dei layer sliding attention (finestra limitata).
+    pub fn sliding_indices(&self) -> Vec<usize> {
+        self.layers
+            .iter()
+            .enumerate()
+            .filter(|(_, l)| l.kind == LayerKind::SlidingAttn)
+            .map(|(i, _)| i)
+            .collect()
     }
 }
 
