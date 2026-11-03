@@ -22,10 +22,12 @@
 //!   `attn_q_norm[128]`, `attn_k_norm[128]` (+ 4 norm, ffn)
 //! - globali: `token_embd[2048,128000]`, `output_norm[2048]`, `rope_freqs[64]`
 //!
-//! STATO: questo modulo copre SOLO config + classificazione dei layer + test.
-//! Il forward NON c'è ancora, quindi `Famiglia::Lfm3` resta fuori da
-//! `registry::Famiglia::from_arch` finché la parity non esiste — regola del
-//! registro: "mai per speranza". Il server rifiuta `lfm3` con errore esplicito.
+//! STATO: config + classificazione dei layer + i due blocchi di forward
+//! isolati (F10-6 shortconv, F10-7 attenzione) + test. Manca il `Model`
+//! completo (embedding, MLP, residui, output head), quindi `Famiglia::Lfm3`
+//! resta fuori da `registry::Famiglia::from_arch` finché la parity non
+//! esiste — regola del registro: "mai per speranza". Il server rifiuta
+//! `lfm3` con errore esplicito.
 
 use s_gguf::{GgufFile, GgufValue, TensorInfo};
 
@@ -242,6 +244,23 @@ impl Config {
             LayerKind::FullAttn => Some(self.rope_theta),
         })
     }
+
+    /// Numero di frequenze RoPE ruotate per il layer `li`, LETTO dal GGUF:
+    /// `lfm3.rope.dimension_count / 2` (64 sul modello reale, dove il
+    /// dimension_count è 128).
+    ///
+    /// ATTENZIONE: è il massimo a rotazione piena. Il `partial_rotary_factor`
+    /// di HF (0.5 sui layer full, verificato in `config.json`) NON è nel
+    /// metadata GGUF: è codificato in `rope_freqs.weight` (misurato: 32
+    /// valori 1.0 + 32 valori 1e30 sui full). Chi costruisce un
+    /// [`AttentionBlock`] full deve quindi passare 32 e non il valore di
+    /// questo metodo (vedi la nota F10-7).
+    pub fn rope_angles_for(&self, li: usize) -> Result<usize, String> {
+        Ok(match self.layer_kind(li)? {
+            LayerKind::ShortConv => 0,
+            LayerKind::SlidingAttn | LayerKind::FullAttn => self.rope_n_rot / 2,
+        })
+    }
 }
 
 /// Pesi di un layer shortconv (gated convolution, nessuna attenzione).
@@ -428,7 +447,7 @@ impl Lfm3Weights {
 // Buffer di decode (`causal_conv1d_update`): i valori precedenti di `B * x`
 // (l'ingresso della conv, NON l'uscita), lunghezza `l_cache - 1 = 6`.
 //
-// NON c'è qui: attenzione, MLP, embedding, `Model` completo, dispatch nel
+// NON c'è qui: MLP, embedding, `Model` completo, dispatch nel
 // server, `Famiglia::Lfm3`, CUDA. Solo il blocco.
 // ═══════════════════════════════════════════════════════════════════
 
@@ -657,6 +676,466 @@ fn matvec(m: &[f32], cols: usize, rows: usize, x: &[f32], y: &mut [f32]) {
             sum += x[i] * m[j * cols + i];
         }
         y[j] = sum;
+    }
+}
+
+// ═══════════════════════════════════════════════════════════════════
+// F10-7 — forward dell'ATTENZIONE (solo il blocco).
+//
+// Formula da `Lfm3Attention.forward` di `LiquidAI/LFM3-1.7B`
+// (`modeling_lfm3.py`, verificata il 03/11/2026 sul sorgente ufficiale):
+//
+// ```python
+// q = q_norm(q_proj(h).view(..., n_heads, head_dim))      # RMSNorm per testa
+// k = k_norm(k_proj(h).view(..., n_kv_heads, head_dim))
+// v = v_proj(h).view(..., n_kv_heads, head_dim)
+// q, k = apply_rotary_pos_emb(q, k, cos, sin)             # f32, rotate_half
+// o = attenzione_causale(q, k, v)                         # GQA, scala head_dim^-0.5
+// o = o * sigmoid(gate_proj(h))                           # gate PER TESTA
+// out = o_proj(o)
+// ```
+//
+// Particolari MISURATI, non dedotti:
+// - RoPE `rotate_half` (convenzione HF): `[x1, x2] → [x1·cos − x2·sin,
+//   x2·cos + x1·sin]`, non la variante interleaved.
+// - `partial_rotary_factor = 0.5` sui layer full (`config.json` ufficiale):
+//   su 64 frequenze ruotano solo le prime 32; le altre hanno `inv_freq = 0`
+//   (angolo 0 ⇒ cos=1, sin=0 ⇒ dimensioni intatte). Il GGUF NON espone il
+//   fattore nel metadata: lo codifica in `rope_freqs.weight` (32 valori 1.0
+//   + 32 valori 1e30 sui full). Per questo il numero di angoli è un parametro
+//   esplicito di [`AttentionSpec`]; `Config::rope_angles_for` dà il massimo.
+// - Finestra sliding: la maschera HF è `kv_idx > q_idx − sliding_window`
+//   (`transformers/masking_utils.py:99`), quindi il token a distanza esatta
+//   `sliding_window` è ESCLUSO (256 chiavi, non 257). La formula del task
+//   ("indice < pos − 256") ne terrebbe 257: qui si segue il riferimento.
+//
+// NON c'è qui: KV cache persistente su device, MLP, embedding, `Model`
+// completo, dispatch nel server, `Famiglia::Lfm3`. Solo il blocco.
+// ═══════════════════════════════════════════════════════════════════
+
+/// Dimensioni e parametri del blocco attention (un layer).
+///
+/// `rope_angles` è il numero di frequenze ruotate: `head_dim/2` a rotazione
+/// piena (layer sliding), 32 su 64 per i layer full (partial factor 0.5).
+/// Le frequenze oltre `rope_angles` hanno inv_freq 0 e non ruotano.
+#[derive(Debug, Clone, Copy)]
+pub struct AttentionSpec {
+    pub n_embd: usize,
+    pub n_heads: usize,
+    pub n_kv_heads: usize,
+    pub head_dim: usize,
+    pub rms_eps: f32,
+    pub rope_theta: f32,
+    pub rope_angles: usize,
+    /// `None` = attenzione globale; `Some(w)` = sliding di `w` chiavi.
+    pub finestra: Option<usize>,
+}
+
+/// Pesi densi f32 del blocco attention, pronti per il forward CPU.
+///
+/// Stessa convenzione di [`ShortConvBlock`] (ordine dei byte GGUF, dims
+/// `[in, out]` → flat C-order `[out, in]`):
+/// - `q`: `[n_heads*head_dim, n_embd]`
+/// - `k`, `v`: `[n_kv_heads*head_dim, n_embd]`
+/// - `output`: `[n_embd, n_heads*head_dim]`
+/// - `gate`: `[n_heads, n_embd]`
+/// - `q_norm`, `k_norm`: `[head_dim]`
+#[derive(Debug, Clone)]
+pub struct AttentionDense {
+    pub q: Vec<f32>,
+    pub k: Vec<f32>,
+    pub v: Vec<f32>,
+    pub output: Vec<f32>,
+    pub gate: Vec<f32>,
+    pub q_norm: Vec<f32>,
+    pub k_norm: Vec<f32>,
+}
+
+/// Pesi densi + parametri del blocco attention.
+#[derive(Debug, Clone)]
+pub struct AttentionBlock {
+    pub spec: AttentionSpec,
+    pub pesi: AttentionDense,
+}
+
+impl AttentionBlock {
+    /// Costruisce il blocco verificando tutte le forme.
+    ///
+    /// Niente `unwrap`: ogni errore nomina il tensore, la lunghezza attesa
+    /// e quella trovata.
+    pub fn new(spec: AttentionSpec, pesi: AttentionDense) -> Result<Self, String> {
+        if spec.n_embd == 0 {
+            return Err("attention: n_embd deve essere > 0".into());
+        }
+        if spec.head_dim == 0 || !spec.head_dim.is_multiple_of(2) {
+            return Err(format!(
+                "attention: head_dim deve essere pari e > 0, trovato {}",
+                spec.head_dim
+            ));
+        }
+        if spec.n_heads == 0 || spec.n_kv_heads == 0 {
+            return Err("attention: n_heads e n_kv_heads devono essere > 0".into());
+        }
+        if !spec.n_heads.is_multiple_of(spec.n_kv_heads) {
+            return Err(format!(
+                "attention: n_heads ({}) non è multiplo di n_kv_heads ({})",
+                spec.n_heads, spec.n_kv_heads
+            ));
+        }
+        if spec.rope_angles > spec.head_dim / 2 {
+            return Err(format!(
+                "attention: rope_angles {} > head_dim/2 = {}",
+                spec.rope_angles,
+                spec.head_dim / 2
+            ));
+        }
+        if matches!(spec.finestra, Some(0)) {
+            return Err("attention: finestra sliding deve essere > 0".into());
+        }
+
+        let nq = spec.n_heads * spec.head_dim;
+        let nkv = spec.n_kv_heads * spec.head_dim;
+        let ne = spec.n_embd;
+        let atteso = |nome: &str, len: usize, voluto: usize| -> Result<(), String> {
+            if len != voluto {
+                return Err(format!(
+                    "attention {nome}: attesi {voluto} elementi, trovati {len}"
+                ));
+            }
+            Ok(())
+        };
+        atteso("q", pesi.q.len(), ne * nq)?;
+        atteso("k", pesi.k.len(), ne * nkv)?;
+        atteso("v", pesi.v.len(), ne * nkv)?;
+        atteso("output", pesi.output.len(), ne * nq)?;
+        atteso("gate", pesi.gate.len(), ne * spec.n_heads)?;
+        atteso("q_norm", pesi.q_norm.len(), spec.head_dim)?;
+        atteso("k_norm", pesi.k_norm.len(), spec.head_dim)?;
+
+        Ok(Self { spec, pesi })
+    }
+
+    /// Dimensione dell'uscita Q (teste × head_dim).
+    pub fn n_q(&self) -> usize {
+        self.spec.n_heads * self.spec.head_dim
+    }
+
+    /// Dimensione di K e V (KV head × head_dim).
+    pub fn n_kv(&self) -> usize {
+        self.spec.n_kv_heads * self.spec.head_dim
+    }
+
+    /// q, k, v per UNA posizione: proiezioni, RMSNorm per testa, RoPE.
+    /// Esposta per i test sulle forme; il forward la usa internamente.
+    pub fn calcola_qkv(&self, h: &[f32], pos: usize) -> (Vec<f32>, Vec<f32>, Vec<f32>) {
+        let s = &self.spec;
+        let ne = s.n_embd;
+        let hd = s.head_dim;
+        let nq = self.n_q();
+        let nkv = self.n_kv();
+        assert_eq!(h.len(), ne, "attention qkv: h ha {} elementi, attesi {ne}", h.len());
+
+        // 1. Proiezioni.
+        let mut q = vec![0.0f32; nq];
+        matvec(&self.pesi.q, ne, nq, h, &mut q);
+        let mut k = vec![0.0f32; nkv];
+        matvec(&self.pesi.k, ne, nkv, h, &mut k);
+        let mut v = vec![0.0f32; nkv];
+        matvec(&self.pesi.v, ne, nkv, h, &mut v);
+
+        // 2. RMSNorm per testa (q_norm / k_norm), prima della RoPE.
+        for hh in 0..s.n_heads {
+            rmsnorm_in_place(&mut q[hh * hd..(hh + 1) * hd], &self.pesi.q_norm, s.rms_eps);
+        }
+        for hh in 0..s.n_kv_heads {
+            rmsnorm_in_place(&mut k[hh * hd..(hh + 1) * hd], &self.pesi.k_norm, s.rms_eps);
+        }
+
+        // 3. RoPE in f32 su q e k.
+        rope_rotante(&mut q, s.n_heads, hd, s.rope_theta, s.rope_angles, pos);
+        rope_rotante(&mut k, s.n_kv_heads, hd, s.rope_theta, s.rope_angles, pos);
+        (q, k, v)
+    }
+
+    /// Attenzione causale (con eventuale finestra) per UNA query.
+    ///
+    /// `k`/`v` sono il prefisso `[t, n_kv]` con posizione assoluta della
+    /// prima chiave `k_abs0`; `q_abs` è la posizione assoluta della query.
+    /// Restituisce l'uscita per testa `[n_heads*head_dim]`, senza gate né
+    /// `o_proj`. La visibilità segue il riferimento HF:
+    /// `k_abs <= q_abs` (causale) e, con finestra `w`, `k_abs > q_abs − w`.
+    fn attenzione_grezza(
+        &self,
+        q: &[f32],
+        k: &[f32],
+        v: &[f32],
+        t: usize,
+        k_abs0: usize,
+        q_abs: usize,
+    ) -> Vec<f32> {
+        let s = &self.spec;
+        let hd = s.head_dim;
+        let nq = self.n_q();
+        let nkv = self.n_kv();
+        assert_eq!(q.len(), nq, "attention: q ha {} elementi, attesi {nq}", q.len());
+        assert_eq!(
+            k.len(),
+            t * nkv,
+            "attention: k ha {} elementi, attesi {t}*{nkv}",
+            k.len()
+        );
+        assert_eq!(
+            v.len(),
+            t * nkv,
+            "attention: v ha {} elementi, attesi {t}*{nkv}",
+            v.len()
+        );
+
+        let gruppo = s.n_heads / s.n_kv_heads;
+        let scala = 1.0 / (hd as f32).sqrt();
+        let mut out = vec![0.0f32; nq];
+        let mut punteggi = vec![0.0f32; t];
+
+        for hh in 0..s.n_heads {
+            let kvh = hh / gruppo;
+            let qb = &q[hh * hd..(hh + 1) * hd];
+
+            // 1. score = (q·k) * head_dim^-0.5, con maschera causale/finestra.
+            let mut max = f32::NEG_INFINITY;
+            for j in 0..t {
+                let k_abs = k_abs0 + j;
+                let causale = k_abs <= q_abs;
+                let in_finestra = match s.finestra {
+                    None => true,
+                    Some(w) => k_abs + w > q_abs,
+                };
+                if !(causale && in_finestra) {
+                    punteggi[j] = f32::NEG_INFINITY;
+                    continue;
+                }
+                let kb = &k[j * nkv + kvh * hd..j * nkv + kvh * hd + hd];
+                let mut sum = 0.0f32;
+                for d in 0..hd {
+                    sum += qb[d] * kb[d];
+                }
+                let sc = sum * scala;
+                punteggi[j] = sc;
+                if sc > max {
+                    max = sc;
+                }
+            }
+
+            // 2. Softmax stabile (max-shift).
+            let mut somma = 0.0f32;
+            for p in punteggi.iter_mut() {
+                if p.is_finite() {
+                    *p = (*p - max).exp();
+                    somma += *p;
+                } else {
+                    *p = 0.0;
+                }
+            }
+            assert!(somma > 0.0, "attention: nessuna chiave visibile (query {q_abs})");
+
+            // 3. Somma pesata su v.
+            for j in 0..t {
+                let w = punteggi[j] / somma;
+                if w == 0.0 {
+                    continue;
+                }
+                let vb = &v[j * nkv + kvh * hd..j * nkv + kvh * hd + hd];
+                let ob = &mut out[hh * hd..(hh + 1) * hd];
+                for d in 0..hd {
+                    ob[d] += w * vb[d];
+                }
+            }
+        }
+        out
+    }
+
+    /// Gate sigmoideo per testa: `sigmoid(gate_proj(h))`, `[n_heads]`.
+    fn calcola_gate(&self, h: &[f32]) -> Vec<f32> {
+        let s = &self.spec;
+        let mut g = vec![0.0f32; s.n_heads];
+        matvec(&self.pesi.gate, s.n_embd, s.n_heads, h, &mut g);
+        for x in g.iter_mut() {
+            *x = sigmoid(*x);
+        }
+        g
+    }
+
+    /// Moltiplica l'uscita attention per il gate, testa per testa.
+    /// Funzione separata perché il gate è moltiplicativo: con `gate` tutta a
+    /// zero l'uscita si annulla esattamente.
+    fn applica_gate(&self, attn: &mut [f32], gate: &[f32]) {
+        let hd = self.spec.head_dim;
+        assert_eq!(
+            attn.len(),
+            self.n_q(),
+            "attention: attn ha {} elementi, attesi {}",
+            attn.len(),
+            self.n_q()
+        );
+        assert_eq!(
+            gate.len(),
+            self.spec.n_heads,
+            "attention: gate ha {} elementi, attesi {}",
+            gate.len(),
+            self.spec.n_heads
+        );
+        for (hh, &g) in gate.iter().enumerate() {
+            for x in &mut attn[hh * hd..(hh + 1) * hd] {
+                *x *= g;
+            }
+        }
+    }
+
+    /// Gate + `o_proj` su una posizione.
+    fn uscita(&self, h: &[f32], attn: &[f32], out: &mut [f32]) {
+        let ne = self.spec.n_embd;
+        assert_eq!(out.len(), ne, "attention: out ha {} elementi, attesi {ne}", out.len());
+        let g = self.calcola_gate(h);
+        let mut gated = attn.to_vec();
+        self.applica_gate(&mut gated, &g);
+        matvec(&self.pesi.output, self.n_q(), ne, &gated, out);
+    }
+
+    /// Decode: una posizione `h [n_embd]` → `out [n_embd]`.
+    ///
+    /// `k_cache`/`v_cache` sono flat `[pos, n_kv]` e devono contenere le
+    /// posizioni `0..pos` (stesso contratto di una cache che parte da zero:
+    /// `cache.len() == pos * n_kv`). Il token corrente viene accodato e
+    /// l'attenzione vede tutto il prefisso (con finestra se sliding).
+    pub fn forward_step(
+        &self,
+        h: &[f32],
+        pos: usize,
+        k_cache: &mut Vec<f32>,
+        v_cache: &mut Vec<f32>,
+        out: &mut [f32],
+    ) {
+        let nkv = self.n_kv();
+        assert_eq!(
+            k_cache.len(),
+            v_cache.len(),
+            "attention step: k_cache ha {} elementi, v_cache {}",
+            k_cache.len(),
+            v_cache.len()
+        );
+        assert_eq!(
+            k_cache.len(),
+            pos * nkv,
+            "attention step: la cache deve contenere pos={pos} chiavi ({} elementi), trovati {}",
+            pos * nkv,
+            k_cache.len()
+        );
+
+        let (q, k, v) = self.calcola_qkv(h, pos);
+        k_cache.extend_from_slice(&k);
+        v_cache.extend_from_slice(&v);
+
+        let attn = self.attenzione_grezza(&q, k_cache, v_cache, pos + 1, 0, pos);
+        self.uscita(h, &attn, out);
+    }
+
+    /// Prefill: `t` posizioni in un colpo (`h`/`out` flat `[t, n_embd]`).
+    ///
+    /// Ogni posizione vede solo il prefisso causale (e la finestra, se
+    /// sliding). Le posizioni assolute partono da `pos0`. Nessuna cache
+    /// persistente: è il riferimento CPU, non il percorso del motore.
+    pub fn forward_seq(&self, h: &[f32], t: usize, pos0: usize, out: &mut [f32]) {
+        let s = &self.spec;
+        let ne = s.n_embd;
+        let nkv = self.n_kv();
+        assert_eq!(
+            h.len(),
+            t * ne,
+            "attention seq: h ha {} elementi, attesi {t}*{ne}",
+            h.len()
+        );
+        assert_eq!(
+            out.len(),
+            t * ne,
+            "attention seq: out ha {} elementi, attesi {t}*{ne}",
+            out.len()
+        );
+        if t == 0 {
+            return;
+        }
+
+        // K/V dell'intero prefisso, in ordine di posizione.
+        let mut ks = vec![0.0f32; t * nkv];
+        let mut vs = vec![0.0f32; t * nkv];
+        for p in 0..t {
+            let hp = &h[p * ne..(p + 1) * ne];
+            let (q, k, v) = self.calcola_qkv(hp, pos0 + p);
+            ks[p * nkv..(p + 1) * nkv].copy_from_slice(&k);
+            vs[p * nkv..(p + 1) * nkv].copy_from_slice(&v);
+
+            let attn =
+                self.attenzione_grezza(&q, &ks[..(p + 1) * nkv], &vs[..(p + 1) * nkv], p + 1, pos0, pos0 + p);
+            self.uscita(hp, &attn, &mut out[p * ne..(p + 1) * ne]);
+        }
+    }
+}
+
+/// RMSNorm di una testa, in place: `x * rsqrt(mean(x²)+eps) * w`.
+/// Stessa formula di `rmsnorm_row` in `qwen2.rs` (T5LayerNorm della reference).
+fn rmsnorm_in_place(x: &mut [f32], w: &[f32], eps: f32) {
+    let n = x.len();
+    assert_eq!(w.len(), n, "rmsnorm: peso di {} elementi per testa di {n}", w.len());
+    let mut ss = 0.0f32;
+    for &v in x.iter() {
+        ss += v * v;
+    }
+    let inv = 1.0 / (ss / n as f32 + eps).sqrt();
+    for i in 0..n {
+        x[i] = x[i] * inv * w[i];
+    }
+}
+
+/// RoPE `rotate_half` sui gruppi di `head_dim`.
+///
+/// `inv_freq[i] = theta^(-2i/head_dim)` per `i < rope_angles`, zero oltre:
+/// con inv_freq 0 l'angolo è 0, quindi cos=1 e sin=0 e le dimensioni
+/// restano intatte (coda non ruotata del partial RoPE).
+fn rope_rotante(
+    x: &mut [f32],
+    n_heads: usize,
+    head_dim: usize,
+    theta: f32,
+    rope_angles: usize,
+    pos: usize,
+) {
+    let half = head_dim / 2;
+    let n_ang = rope_angles.min(half);
+    assert_eq!(
+        x.len(),
+        n_heads * head_dim,
+        "rope: {} elementi per {n_heads} teste da {head_dim}",
+        x.len()
+    );
+    for hh in 0..n_heads {
+        let base = hh * head_dim;
+        for i in 0..n_ang {
+            let freq = theta.powf(-(2.0 * i as f32) / head_dim as f32);
+            let ang = pos as f32 * freq;
+            let (sin, cos) = ang.sin_cos();
+            let x1 = x[base + i];
+            let x2 = x[base + i + half];
+            x[base + i] = x1 * cos - x2 * sin;
+            x[base + i + half] = x2 * cos + x1 * sin;
+        }
+    }
+}
+
+/// Sigmoide stabile.
+fn sigmoid(x: f32) -> f32 {
+    if x >= 0.0 {
+        1.0 / (1.0 + (-x).exp())
+    } else {
+        let e = x.exp();
+        e / (1.0 + e)
     }
 }
 
@@ -938,5 +1417,207 @@ mod tests {
         // Con buffer azzerato i primi 3 passi non dipendono dal futuro.
         let d = max_diff(&out3, &out5[..3 * ne]);
         assert!(d <= 1e-6, "stato non azzerato: i primi 3 passi cambiano ({d:e})");
+    }
+
+    // ── F10-7: forward attenzione con dimensioni finte piccole ──
+    // n_embd = 8, 2 teste q da 4, 1 KV head da 4: GQA con 2 teste per KV.
+    const AT_NE: usize = 8;
+    const AT_HD: usize = 4;
+    const AT_NH: usize = 2;
+    const AT_NKV: usize = 1;
+
+    fn spec_attn(theta: f32, finestra: Option<usize>, angoli: usize) -> AttentionSpec {
+        AttentionSpec {
+            n_embd: AT_NE,
+            n_heads: AT_NH,
+            n_kv_heads: AT_NKV,
+            head_dim: AT_HD,
+            rms_eps: 1e-5,
+            rope_theta: theta,
+            rope_angles: angoli,
+            finestra,
+        }
+    }
+
+    fn block_attn(spec: AttentionSpec) -> AttentionBlock {
+        let ne = AT_NE;
+        let nq = AT_NH * AT_HD;
+        let nkv = AT_NKV * AT_HD;
+        AttentionBlock::new(
+            spec,
+            AttentionDense {
+                q: vec_lcg(ne * nq, 0xA77E_0001),
+                k: vec_lcg(ne * nkv, 0xA77E_0002),
+                v: vec_lcg(ne * nkv, 0xA77E_0003),
+                output: vec_lcg(ne * nq, 0xA77E_0004),
+                gate: vec_lcg(ne * AT_NH, 0xA77E_0005),
+                q_norm: vec_lcg(AT_HD, 0xA77E_0006),
+                k_norm: vec_lcg(AT_HD, 0xA77E_0007),
+            },
+        )
+        .expect("forme di prova corrette")
+    }
+
+    #[test]
+    fn forme_qkv_attese() {
+        let blk = block_attn(spec_attn(1_000_000.0, None, AT_HD / 2));
+        assert_eq!(blk.n_q(), AT_NH * AT_HD);
+        assert_eq!(blk.n_kv(), AT_NKV * AT_HD);
+        let h = vec_lcg(AT_NE, 42);
+        let (q, k, v) = blk.calcola_qkv(&h, 3);
+        assert_eq!(q.len(), blk.n_q(), "q deve essere [n_heads*head_dim]");
+        assert_eq!(k.len(), blk.n_kv(), "k deve essere [n_kv_heads*head_dim]");
+        assert_eq!(v.len(), blk.n_kv(), "v deve essere [n_kv_heads*head_dim]");
+        assert!(q.iter().chain(&k).chain(&v).all(|x| x.is_finite()));
+    }
+
+    #[test]
+    fn una_posizione_restituisce_v() {
+        let blk = block_attn(spec_attn(1_000_000.0, None, AT_HD / 2));
+        let q = vec_lcg(blk.n_q(), 11);
+        let k = vec_lcg(blk.n_kv(), 12);
+        let v = vec_lcg(blk.n_kv(), 13);
+        // Una sola chiave: softmax = 1, quindi l'uscita (pre-gate) è v,
+        // replicato sulle due teste q che condividono la stessa KV head.
+        let out = blk.attenzione_grezza(&q, &k, &v, 1, 0, 0);
+        assert_eq!(out.len(), blk.n_q());
+        for hh in 0..AT_NH {
+            let d = max_diff(&out[hh * AT_HD..(hh + 1) * AT_HD], &v);
+            assert!(d <= 1e-7, "testa {hh}: attenzione a una posizione != v ({d:e})");
+        }
+    }
+
+    #[test]
+    fn gate_a_zero_azzera_l_attenzione() {
+        let blk = block_attn(spec_attn(1_000_000.0, None, AT_HD / 2));
+        let mut attn = vec_lcg(blk.n_q(), 21);
+        blk.applica_gate(&mut attn, &vec![0.0f32; AT_NH]);
+        assert!(
+            attn.iter().all(|&x| x == 0.0),
+            "gate nullo non ha azzerato l'uscita: {attn:?}"
+        );
+    }
+
+    #[test]
+    fn maschera_sliding_esclude_i_vecchi() {
+        // Finestra 2: la query in posizione 5 vede SOLO le chiavi 4 e 5
+        // (riferimento HF: k_abs > q_abs - w), non la 3.
+        let blk = block_attn(spec_attn(1_000_000.0, Some(2), AT_HD / 2));
+        let t = 6;
+        let hd = AT_HD;
+        let q = vec![0.0f32; blk.n_q()]; // score tutti uguali → media delle v visibili
+        let k = vec![0.0f32; t * blk.n_kv()];
+        let mut v = vec![0.0f32; t * blk.n_kv()];
+        for j in 0..t {
+            for d in 0..hd {
+                v[j * hd + d] = (j * 10 + d) as f32;
+            }
+        }
+        let out = blk.attenzione_grezza(&q, &k, &v, t, 0, 5);
+        // Uscita attesa: media di v[4] e v[5] (tutte e due le teste q).
+        for hh in 0..AT_NH {
+            for d in 0..hd {
+                let attesa = ((4 * 10 + d) as f32 + (5 * 10 + d) as f32) / 2.0;
+                let got = out[hh * hd + d];
+                assert!(
+                    (got - attesa).abs() <= 1e-5,
+                    "finestra: testa {hh} dim {d}: {got} != {attesa} (chiave vecchia inclusa?)"
+                );
+            }
+        }
+    }
+
+    #[test]
+    fn finestra_globale_vede_tutto_il_prefisso() {
+        let blk = block_attn(spec_attn(1_000_000.0, None, AT_HD / 2));
+        let t = 6;
+        let hd = AT_HD;
+        let q = vec![0.0f32; blk.n_q()];
+        let k = vec![0.0f32; t * blk.n_kv()];
+        let mut v = vec![0.0f32; t * blk.n_kv()];
+        for j in 0..t {
+            for d in 0..hd {
+                v[j * hd + d] = j as f32;
+            }
+        }
+        let out = blk.attenzione_grezza(&q, &k, &v, t, 0, 5);
+        let attesa = (0..t).map(|j| j as f32).sum::<f32>() / t as f32;
+        for &x in &out {
+            assert!((x - attesa).abs() <= 1e-5, "globale: {x} != {attesa}");
+        }
+    }
+
+    #[test]
+    fn due_theta_rotazioni_diverse() {
+        let h = vec_lcg(AT_NE, 33);
+        let piena = block_attn(spec_attn(1_000_000.0, None, AT_HD / 2));
+        let swa = block_attn(spec_attn(10_000.0, None, AT_HD / 2));
+        // a pos 0 l'angolo è 0 per entrambe: q identico
+        let (q0a, _, _) = piena.calcola_qkv(&h, 0);
+        let (q0b, _, _) = swa.calcola_qkv(&h, 0);
+        assert!(max_diff(&q0a, &q0b) <= 1e-7, "pos 0: theta diverse non devono contare");
+        // a pos > 0 le rotazioni divergono
+        let (qa, _, _) = piena.calcola_qkv(&h, 17);
+        let (qb, _, _) = swa.calcola_qkv(&h, 17);
+        assert!(
+            max_diff(&qa, &qb) > 1e-4,
+            "theta 1e6 e 1e4 devono ruotare diversamente (diff {:e})",
+            max_diff(&qa, &qb)
+        );
+    }
+
+    #[test]
+    fn rope_parziale_non_ruota_la_coda() {
+        let mut x = vec_lcg(AT_HD, 55);
+        let prima = x.clone();
+        // Un solo angolo su due: le dimensioni i=1 e i+half non ruotano.
+        rope_rotante(&mut x, 1, AT_HD, 1_000.0, 1, 7);
+        assert!((x[0] - prima[0]).abs() > 1e-4, "la prima dimensione deve ruotare");
+        assert!((x[1] - prima[1]).abs() <= 1e-7, "la coda non deve ruotare");
+        assert!((x[3] - prima[3]).abs() <= 1e-7, "la coda non deve ruotare");
+    }
+
+    #[test]
+    fn step_uguale_a_prefill() {
+        let blk = block_attn(spec_attn(1_000_000.0, None, AT_HD / 2));
+        let t = 5;
+        let h = vec_lcg(t * AT_NE, 66);
+
+        let mut out_seq = vec![0.0f32; t * AT_NE];
+        blk.forward_seq(&h, t, 0, &mut out_seq);
+
+        let mut out_step = vec![0.0f32; t * AT_NE];
+        let mut kc = Vec::new();
+        let mut vc = Vec::new();
+        for p in 0..t {
+            let mut o = vec![0.0f32; AT_NE];
+            blk.forward_step(&h[p * AT_NE..(p + 1) * AT_NE], p, &mut kc, &mut vc, &mut o);
+            out_step[p * AT_NE..(p + 1) * AT_NE].copy_from_slice(&o);
+        }
+
+        let d = max_diff(&out_seq, &out_step);
+        assert!(d <= 1e-6, "prefill vs step: max diff {d:e} > 1e-6");
+    }
+
+    #[test]
+    fn causalita_attention() {
+        let blk = block_attn(spec_attn(1_000_000.0, None, AT_HD / 2));
+        let t = 5;
+        let h = vec_lcg(t * AT_NE, 77);
+
+        let mut out_a = vec![0.0f32; t * AT_NE];
+        blk.forward_seq(&h, t, 0, &mut out_a);
+
+        let mut h2 = h.clone();
+        for i in 0..AT_NE {
+            h2[(t - 1) * AT_NE + i] += 10.0;
+        }
+        let mut out_b = vec![0.0f32; t * AT_NE];
+        blk.forward_seq(&h2, t, 0, &mut out_b);
+
+        let d_pre = max_diff(&out_a[..(t - 1) * AT_NE], &out_b[..(t - 1) * AT_NE]);
+        assert!(d_pre <= 1e-6, "causalità violata: le prime posizioni cambiano ({d_pre:e})");
+        let d_last = max_diff(&out_a[(t - 1) * AT_NE..], &out_b[(t - 1) * AT_NE..]);
+        assert!(d_last > 1e-4, "test vacuo: l'ultimo token non influenza la sua uscita");
     }
 }
