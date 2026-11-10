@@ -1139,6 +1139,365 @@ fn sigmoid(x: f32) -> f32 {
     }
 }
 
+// ═══════════════════════════════════════════════════════════════════
+// F10-8b — Model completo LFM3 (CPU, f32, full-recompute).
+//
+// Struttura verificata sul sorgente ufficiale `LiquidAI/LFM3-1.7B`
+// (`modeling_lfm3.py` e `config.json`, letti il 10/11/2026):
+//
+//   x = embed(tokens)
+//   per layer:
+//     r = x
+//     m = mixer(operator_norm(x))          # shortconv oppure attention
+//     m = post_operator_norm(m)            # sandwich norm (use_sandwich_norm=true)
+//     x = r + m
+//     f = ffn(ffn_norm(x))                 # w2(silu(w1(x)) * w3(x))
+//     f = post_ffn_norm(f)                 # sandwich norm
+//     x = x + f
+//   x = embedding_norm(x)                  # output_norm
+//   logits = x @ lm_head                   # lm_head tied a token_embd
+//
+// Il partial RoPE dei layer full è codificato in `rope_freqs.weight`
+// (32 valori 1.0 + 32 valori ~1e30 sul modello reale): il numero di
+// valori finiti è il numero di angoli ruotati (32). I layer sliding
+// ruotano tutto (`rope.dimension_count / 2` = 64), come da `config.json`
+// ufficiale (`sliding_attention` senza `partial_rotary_factor`).
+//
+// NON c'è qui: forward_cached, ring buffer (F10-8), CUDA, dispatch nel
+// server, `Famiglia::Lfm3`. Solo il Model di riferimento CPU.
+// ═══════════════════════════════════════════════════════════════════
+
+/// Mixer di un layer LFM3: shortconv oppure attention.
+#[derive(Debug, Clone)]
+pub enum Lfm3Mixer {
+    ShortConv(ShortConvBlock),
+    Attention(AttentionBlock),
+}
+
+/// Un layer LFM3 con pesi densi f32 e le 4 norm della sandwich norm.
+#[derive(Debug, Clone)]
+pub struct Lfm3DenseLayer {
+    pub kind: LayerKind,
+    /// `operator_norm` nel riferimento; `attn_norm.weight` nel GGUF.
+    pub operator_norm: Vec<f32>,
+    /// `post_operator_norm` nel riferimento; `post_attention_norm.weight` nel GGUF.
+    pub post_operator_norm: Vec<f32>,
+    pub ffn_norm: Vec<f32>,
+    /// `post_ffn_norm` nel riferimento; `post_ffw_norm.weight` nel GGUF.
+    pub post_ffn_norm: Vec<f32>,
+    /// `w1`: `[n_ff, n_embd]` in C-order (righe = uscite).
+    pub ffn_gate: Vec<f32>,
+    /// `w3`: `[n_ff, n_embd]`.
+    pub ffn_up: Vec<f32>,
+    /// `w2`: `[n_embd, n_ff]`.
+    pub ffn_down: Vec<f32>,
+    pub mixer: Lfm3Mixer,
+}
+
+/// Modello LFM3 completo, CPU, f32.
+///
+/// `load` materializza tutti i pesi in f32: sul 1.7B sono circa 6,9 GB
+/// di RAM. È il riferimento per la parity (F10-9), non il percorso di
+/// produzione.
+pub struct Lfm3Model {
+    pub config: Config,
+    /// `[vocab * n_embd]`, riga `v` = embedding del token `v`.
+    tok_embd: Vec<f32>,
+    output_norm: Vec<f32>,
+    /// `None` = lm_head tied a `token_embd` (config ufficiale: true).
+    output: Option<Vec<f32>>,
+    layers: Vec<Lfm3DenseLayer>,
+}
+
+fn dequant_named(gguf: &mut GgufFile, name: &str) -> Result<Vec<f32>, String> {
+    gguf.tensor_data_f32(name)
+        .map_err(|e| format!("{name}: {e}"))
+}
+
+/// RMSNorm di un vettore, stessa formula di `rmsnorm_row` in `qwen2.rs`
+/// (accumulo f64, come il riferimento CPU).
+fn rmsnorm_vec(input: &[f32], weight: &[f32], eps: f32, output: &mut [f32]) {
+    let n = input.len();
+    assert_eq!(
+        weight.len(),
+        n,
+        "rmsnorm: peso di {} elementi per input di {n}",
+        weight.len()
+    );
+    assert_eq!(
+        output.len(),
+        n,
+        "rmsnorm: output di {} elementi per input di {n}",
+        output.len()
+    );
+    let mut ss = 0.0f64;
+    for &v in input {
+        ss += v as f64 * v as f64;
+    }
+    let inv = 1.0 / ((ss / n as f64 + eps as f64) as f32).sqrt();
+    for i in 0..n {
+        output[i] = input[i] * inv * weight[i];
+    }
+}
+
+/// SiLU del riferimento (`F.silu`).
+fn silu_lfm3(x: f32) -> f32 {
+    x / (1.0 + (-x).exp())
+}
+
+/// `y[v] = Σ_d output[v * n_embd + d] · hidden[d]`.
+/// Stessa convenzione di `logits_from_hidden` in `qwen35.rs`.
+fn logits_da_hidden(output: &[f32], n_embd: usize, hidden: &[f32]) -> Vec<f32> {
+    let vocab = output.len() / n_embd;
+    let mut logits = vec![0.0f32; vocab];
+    for v in 0..vocab {
+        let off = v * n_embd;
+        let mut sum = 0.0f32;
+        for d in 0..n_embd {
+            sum += output[off + d] * hidden[d];
+        }
+        logits[v] = sum;
+    }
+    logits
+}
+
+impl Lfm3Model {
+    /// Carica tutti i pesi dal GGUF e costruisce il Model.
+    ///
+    /// Il numero di angoli RoPE dei layer full viene letto da
+    /// `rope_freqs.weight`: i valori finiti sono le frequenze ruotate,
+    /// i valori ~1e30 sono la coda non ruotata del partial RoPE.
+    pub fn load(path: impl AsRef<std::path::Path>) -> Result<Self, String> {
+        let mut gguf = GgufFile::open(path).map_err(|e| e.to_string())?;
+        let config = Config::from_gguf(&gguf)?;
+        let meta = Lfm3Weights::load(&gguf, &config)?;
+
+        let tok_embd = dequant_named(&mut gguf, &meta.token_embd.name)?;
+        let output_norm = dequant_named(&mut gguf, &meta.output_norm.name)?;
+        let output = match gguf.tensor("output.weight") {
+            Ok(_) => Some(dequant_named(&mut gguf, "output.weight")?),
+            Err(_) => None, // tied embeddings (config.json: tie_word_embeddings=true)
+        };
+        let rope_freqs = dequant_named(&mut gguf, &meta.rope_freqs.name)?;
+        let full_rope_angles = rope_freqs.iter().filter(|v| v.abs() < 1e10).count();
+        if full_rope_angles == 0 {
+            return Err(
+                "rope_freqs.weight: nessuna frequenza finita (partial RoPE illeggibile)".into(),
+            );
+        }
+
+        let ne = config.n_embd;
+        let mut layers = Vec::with_capacity(config.n_layers);
+        for (li, lw) in meta.layers.iter().enumerate() {
+            let mut l = |n: &str| dequant_named(&mut gguf, &format!("blk.{li}.{n}"));
+            let operator_norm = l("attn_norm.weight")?;
+            let post_operator_norm = l("post_attention_norm.weight")?;
+            let ffn_norm = l("ffn_norm.weight")?;
+            let post_ffn_norm = l("post_ffw_norm.weight")?;
+            let ffn_gate = l("ffn_gate.weight")?;
+            let ffn_up = l("ffn_up.weight")?;
+            let ffn_down = l("ffn_down.weight")?;
+
+            let mixer = match &lw.variant {
+                LayerVariant::ShortConv(_) => {
+                    let in_proj = l("shortconv.in_proj.weight")?;
+                    let conv = l("shortconv.conv.weight")?;
+                    let out_proj = l("shortconv.out_proj.weight")?;
+                    Lfm3Mixer::ShortConv(ShortConvBlock::new(
+                        ne,
+                        config.conv_l_cache,
+                        in_proj,
+                        conv,
+                        out_proj,
+                    )?)
+                }
+                LayerVariant::Attention(_) => {
+                    let theta = config.rope_theta_for(li)?.ok_or_else(|| {
+                        format!("layer {li}: variante attention ma nessuna RoPE in config")
+                    })?;
+                    let (rope_angles, finestra) = match lw.kind {
+                        LayerKind::SlidingAttn => {
+                            (config.rope_n_rot / 2, Some(config.sliding_window))
+                        }
+                        LayerKind::FullAttn => (full_rope_angles, None),
+                        LayerKind::ShortConv => {
+                            return Err(format!(
+                                "layer {li}: variante attention ma kind shortconv"
+                            ));
+                        }
+                    };
+                    let spec = AttentionSpec {
+                        n_embd: ne,
+                        n_heads: config.n_heads,
+                        n_kv_heads: config.n_kv_heads,
+                        head_dim: config.head_dim,
+                        rms_eps: config.rms_eps,
+                        rope_theta: theta,
+                        rope_angles,
+                        finestra,
+                    };
+                    let dense = AttentionDense {
+                        q: l("attn_q.weight")?,
+                        k: l("attn_k.weight")?,
+                        v: l("attn_v.weight")?,
+                        output: l("attn_output.weight")?,
+                        gate: l("attn_gate.weight")?,
+                        q_norm: l("attn_q_norm.weight")?,
+                        k_norm: l("attn_k_norm.weight")?,
+                    };
+                    Lfm3Mixer::Attention(AttentionBlock::new(spec, dense)?)
+                }
+            };
+
+            layers.push(Lfm3DenseLayer {
+                kind: lw.kind,
+                operator_norm,
+                post_operator_norm,
+                ffn_norm,
+                post_ffn_norm,
+                ffn_gate,
+                ffn_up,
+                ffn_down,
+                mixer,
+            });
+            if (li + 1) % 6 == 0 {
+                eprintln!("load lfm3: {}/{} layer", li + 1, config.n_layers);
+            }
+        }
+
+        if tok_embd.len() != config.vocab_size * ne {
+            return Err(format!(
+                "token_embd: {} elementi, attesi {} (vocab {} × n_embd {})",
+                tok_embd.len(),
+                config.vocab_size * ne,
+                config.vocab_size,
+                ne
+            ));
+        }
+        if output_norm.len() != ne {
+            return Err(format!(
+                "output_norm: {} elementi, attesi {ne}",
+                output_norm.len()
+            ));
+        }
+        if let Some(out) = &output {
+            if out.len() != config.vocab_size * ne {
+                return Err(format!(
+                    "output.weight: {} elementi, attesi {}",
+                    out.len(),
+                    config.vocab_size * ne
+                ));
+            }
+        }
+
+        Ok(Self {
+            config,
+            tok_embd,
+            output_norm,
+            output,
+            layers,
+        })
+    }
+
+    fn output_matrix(&self) -> &[f32] {
+        self.output.as_deref().unwrap_or(&self.tok_embd)
+    }
+
+    /// Hidden states di tutte le posizioni, flat `[seq * n_embd]`.
+    ///
+    /// Full-recompute: nessuna cache, nessuna ottimizzazione. È il
+    /// riferimento per confrontare il percorso del motore.
+    pub fn forward_hidden(&self, tokens: &[u32]) -> Result<Vec<f32>, String> {
+        let c = &self.config;
+        let seq = tokens.len();
+        if seq == 0 {
+            return Err("forward lfm3: sequenza vuota".into());
+        }
+        let ne = c.n_embd;
+        let nff = c.n_ff;
+
+        let mut x = vec![0.0f32; seq * ne];
+        for (s, &t) in tokens.iter().enumerate() {
+            let ti = t as usize;
+            if ti >= c.vocab_size {
+                return Err(format!(
+                    "token {ti} fuori vocabolario ({} token)",
+                    c.vocab_size
+                ));
+            }
+            x[s * ne..(s + 1) * ne].copy_from_slice(&self.tok_embd[ti * ne..(ti + 1) * ne]);
+        }
+
+        let mut mixer_in = vec![0.0f32; seq * ne];
+        let mut mixer_out = vec![0.0f32; seq * ne];
+        let mut normed = vec![0.0f32; seq * ne];
+        let mut ffn_in = vec![0.0f32; ne];
+        let mut ffn_normed = vec![0.0f32; ne];
+        let mut gate = vec![0.0f32; nff];
+        let mut up = vec![0.0f32; nff];
+        let mut down = vec![0.0f32; ne];
+
+        for layer in &self.layers {
+            // Pre-norm del mixer, riga per riga.
+            for s in 0..seq {
+                rmsnorm_vec(
+                    &x[s * ne..(s + 1) * ne],
+                    &layer.operator_norm,
+                    c.rms_eps,
+                    &mut mixer_in[s * ne..(s + 1) * ne],
+                );
+            }
+            match &layer.mixer {
+                Lfm3Mixer::ShortConv(b) => {
+                    let mut conv_buf = vec![0.0f32; b.hist_rows() * ne];
+                    b.forward_seq(&mixer_in, seq, &mut conv_buf, &mut mixer_out);
+                }
+                Lfm3Mixer::Attention(b) => b.forward_seq(&mixer_in, seq, 0, &mut mixer_out),
+            }
+            // Sandwich norm + residuo del mixer.
+            for s in 0..seq {
+                rmsnorm_vec(
+                    &mixer_out[s * ne..(s + 1) * ne],
+                    &layer.post_operator_norm,
+                    c.rms_eps,
+                    &mut normed[s * ne..(s + 1) * ne],
+                );
+                for i in 0..ne {
+                    x[s * ne + i] += normed[s * ne + i];
+                }
+            }
+
+            // FFN: w2(silu(w1(x)) * w3(x)) con la post-norm sandwich.
+            for s in 0..seq {
+                let row = s * ne;
+                rmsnorm_vec(&x[row..row + ne], &layer.ffn_norm, c.rms_eps, &mut ffn_in);
+                matvec(&layer.ffn_gate, ne, nff, &ffn_in, &mut gate);
+                matvec(&layer.ffn_up, ne, nff, &ffn_in, &mut up);
+                for j in 0..nff {
+                    gate[j] = silu_lfm3(gate[j]) * up[j];
+                }
+                matvec(&layer.ffn_down, nff, ne, &gate, &mut down);
+                rmsnorm_vec(&down, &layer.post_ffn_norm, c.rms_eps, &mut ffn_normed);
+                for i in 0..ne {
+                    x[row + i] += ffn_normed[i];
+                }
+            }
+        }
+
+        Ok(x)
+    }
+
+    /// Logits dell'ultima posizione, `[vocab]`.
+    pub fn forward(&self, tokens: &[u32]) -> Result<Vec<f32>, String> {
+        let hidden = self.forward_hidden(tokens)?;
+        let ne = self.config.n_embd;
+        let last = &hidden[hidden.len() - ne..];
+        let mut normed = vec![0.0f32; ne];
+        rmsnorm_vec(last, &self.output_norm, self.config.rms_eps, &mut normed);
+        Ok(logits_da_hidden(self.output_matrix(), ne, &normed))
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1620,4 +1979,241 @@ mod tests {
         let d_last = max_diff(&out_a[(t - 1) * AT_NE..], &out_b[(t - 1) * AT_NE..]);
         assert!(d_last > 1e-4, "test vacuo: l'ultimo token non influenza la sua uscita");
     }
+    // ── F10-8b: Model completo sintetico ──
+    // Dimensioni finte piccole: il forward resta leggibile a occhio.
+    const MD_NE: usize = 8;
+    const MD_NFF: usize = 16;
+    const MD_HD: usize = 4;
+    const MD_NH: usize = 2;
+    const MD_NKV: usize = 1;
+    const MD_VOCAB: usize = 16;
+
+    fn config_modello() -> Config {
+        Config {
+            n_layers: 3,
+            n_embd: MD_NE,
+            n_ff: MD_NFF,
+            n_heads: MD_NH,
+            n_kv_heads: MD_NKV,
+            head_dim: MD_HD,
+            rope_theta: 1_000_000.0,
+            rope_theta_swa: 10_000.0,
+            rope_n_rot: 8,
+            rms_eps: 1e-5,
+            vocab_size: MD_VOCAB,
+            sliding_window: 3,
+            conv_l_cache: 3,
+            kv_heads_per_layer: vec![0, MD_NKV, MD_NKV],
+            sliding_pattern: vec![false, true, false],
+        }
+    }
+
+    fn layer_con_mixer(kind: LayerKind, mixer: Lfm3Mixer, seed: u64) -> Lfm3DenseLayer {
+        let ne = MD_NE;
+        let nff = MD_NFF;
+        Lfm3DenseLayer {
+            kind,
+            operator_norm: vec_lcg(ne, seed),
+            post_operator_norm: vec_lcg(ne, seed + 1),
+            ffn_norm: vec_lcg(ne, seed + 2),
+            post_ffn_norm: vec_lcg(ne, seed + 3),
+            ffn_gate: vec_lcg(nff * ne, seed + 4),
+            ffn_up: vec_lcg(nff * ne, seed + 5),
+            ffn_down: vec_lcg(ne * nff, seed + 6),
+            mixer,
+        }
+    }
+
+    fn layer_shortconv(seed: u64) -> Lfm3DenseLayer {
+        let ne = MD_NE;
+        let mixer = Lfm3Mixer::ShortConv(
+            ShortConvBlock::new(
+                ne,
+                3,
+                vec_lcg(3 * ne * ne, seed),
+                vec_lcg(ne * 3, seed + 1),
+                vec_lcg(ne * ne, seed + 2),
+            )
+            .expect("forme shortconv di prova corrette"),
+        );
+        layer_con_mixer(LayerKind::ShortConv, mixer, seed + 10)
+    }
+
+    fn layer_attention(
+        kind: LayerKind,
+        angles: usize,
+        finestra: Option<usize>,
+        seed: u64,
+    ) -> Lfm3DenseLayer {
+        let ne = MD_NE;
+        let nq = MD_NH * MD_HD;
+        let nkv = MD_NKV * MD_HD;
+        let spec = AttentionSpec {
+            n_embd: ne,
+            n_heads: MD_NH,
+            n_kv_heads: MD_NKV,
+            head_dim: MD_HD,
+            rms_eps: 1e-5,
+            rope_theta: 1_000.0,
+            rope_angles: angles,
+            finestra,
+        };
+        let mixer = Lfm3Mixer::Attention(
+            AttentionBlock::new(
+                spec,
+                AttentionDense {
+                    q: vec_lcg(ne * nq, seed),
+                    k: vec_lcg(ne * nkv, seed + 1),
+                    v: vec_lcg(ne * nkv, seed + 2),
+                    output: vec_lcg(ne * nq, seed + 3),
+                    gate: vec_lcg(ne * MD_NH, seed + 4),
+                    q_norm: vec_lcg(MD_HD, seed + 5),
+                    k_norm: vec_lcg(MD_HD, seed + 6),
+                },
+            )
+            .expect("forme attention di prova corrette"),
+        );
+        layer_con_mixer(kind, mixer, seed + 10)
+    }
+
+    fn modello_sintetico() -> Lfm3Model {
+        Lfm3Model {
+            config: config_modello(),
+            tok_embd: vec_lcg(MD_VOCAB * MD_NE, 900),
+            output_norm: vec_lcg(MD_NE, 901),
+            output: None,
+            layers: vec![
+                layer_shortconv(100),
+                layer_attention(LayerKind::SlidingAttn, 2, Some(3), 200),
+                layer_attention(LayerKind::FullAttn, 1, None, 300),
+            ],
+        }
+    }
+
+    #[test]
+    fn modello_sintetico_forward_finito_e_deterministico() {
+        let m = modello_sintetico();
+        let a = m.forward(&[1, 2, 3]).expect("forward");
+        let b = m.forward(&[1, 2, 3]).expect("forward ripetuto");
+        assert_eq!(a.len(), MD_VOCAB, "logits di lunghezza vocab");
+        assert!(a.iter().all(|v| v.is_finite()), "logits non finiti");
+        assert_eq!(a, b, "il forward full-recompute deve essere deterministico");
+    }
+
+    #[test]
+    fn modello_sintetico_causale() {
+        let m = modello_sintetico();
+        let a = m.forward_hidden(&[1, 2, 3]).expect("forward A");
+        let b = m.forward_hidden(&[1, 2, 4]).expect("forward B");
+        let d_pre = max_diff(&a[..2 * MD_NE], &b[..2 * MD_NE]);
+        assert!(
+            d_pre <= 1e-6,
+            "causalità violata: le prime due posizioni cambiano ({d_pre:e})"
+        );
+        let d_last = max_diff(&a[2 * MD_NE..], &b[2 * MD_NE..]);
+        assert!(
+            d_last > 1e-6,
+            "test vacuo: il terzo token non cambia l'ultima posizione ({d_last:e})"
+        );
+    }
+
+    #[test]
+    fn modello_sintetico_sandwich_norm_e_residuo() {
+        // Un layer shortconv, FFN a zero: l'uscita è
+        //   x1 = x0 + post_operator_norm(mixer(operator_norm(x0)))
+        // e possiamo ricostruirla a mano col blocco mixer.
+        let layer = layer_shortconv(500);
+        let mixer_clone = layer.mixer.clone();
+        let mut config = config_modello();
+        config.n_layers = 1;
+        config.kv_heads_per_layer = vec![0];
+        config.sliding_pattern = vec![false];
+        let m = Lfm3Model {
+            config,
+            tok_embd: vec_lcg(MD_VOCAB * MD_NE, 900),
+            output_norm: vec_lcg(MD_NE, 901),
+            output: None,
+            layers: vec![Lfm3DenseLayer {
+                ffn_gate: vec![0.0; MD_NFF * MD_NE],
+                ffn_up: vec![0.0; MD_NFF * MD_NE],
+                ffn_down: vec![0.0; MD_NE * MD_NFF],
+                ..layer
+            }],
+        };
+
+        let tok = 5usize;
+        let x0 = m.tok_embd[tok * MD_NE..(tok + 1) * MD_NE].to_vec();
+
+        let mut n1 = vec![0.0f32; MD_NE];
+        rmsnorm_vec(&x0, &m.layers[0].operator_norm, m.config.rms_eps, &mut n1);
+        let mut m_raw = vec![0.0f32; MD_NE];
+        match &mixer_clone {
+            Lfm3Mixer::ShortConv(b) => {
+                let mut buf = vec![0.0f32; b.hist_rows() * MD_NE];
+                b.forward_step(&n1, &mut buf, &mut m_raw);
+            }
+            Lfm3Mixer::Attention(_) => panic!("questo test usa shortconv"),
+        }
+        let mut m_post = vec![0.0f32; MD_NE];
+        rmsnorm_vec(
+            &m_raw,
+            &m.layers[0].post_operator_norm,
+            m.config.rms_eps,
+            &mut m_post,
+        );
+        let mut x1 = x0.clone();
+        for i in 0..MD_NE {
+            x1[i] += m_post[i];
+        }
+
+        let mut last = vec![0.0f32; MD_NE];
+        rmsnorm_vec(&x1, &m.output_norm, m.config.rms_eps, &mut last);
+        let expected = logits_da_hidden(&m.tok_embd, MD_NE, &last);
+        let got = m.forward(&[tok as u32]).expect("forward del modello");
+        let d = max_diff(&expected, &got);
+        assert!(d <= 1e-6, "wiring residuo/norm sbagliato: max diff {d:e}");
+
+        // Controprova: SENZA la post-norm il risultato deve cambiare.
+        let mut x1_no_post = x0.clone();
+        for i in 0..MD_NE {
+            x1_no_post[i] += m_raw[i];
+        }
+        let mut last_no_post = vec![0.0f32; MD_NE];
+        rmsnorm_vec(
+            &x1_no_post,
+            &m.output_norm,
+            m.config.rms_eps,
+            &mut last_no_post,
+        );
+        let expected_no_post = logits_da_hidden(&m.tok_embd, MD_NE, &last_no_post);
+        let d_no_post = max_diff(&expected_no_post, &got);
+        assert!(
+            d_no_post > 1e-6,
+            "la post_operator_norm non ha effetto: il test sarebbe vacuo ({d_no_post:e})"
+        );
+    }
+
+    #[test]
+    fn modello_sintetico_ffn_contribuisce() {
+        let m1 = modello_sintetico();
+        let mut m2 = modello_sintetico();
+        for l in &mut m2.layers {
+            l.ffn_gate.fill(0.0);
+            l.ffn_up.fill(0.0);
+        }
+        let a = m1.forward(&[1, 2]).expect("forward con FFN");
+        let b = m2.forward(&[1, 2]).expect("forward senza FFN");
+        assert!(
+            max_diff(&a, &b) > 1e-6,
+            "la FFN non cambia l'uscita: il ramo non è cablato"
+        );
+    }
+
+    #[test]
+    fn modello_sintetico_token_fuori_vocab() {
+        let m = modello_sintetico();
+        let e = m.forward(&[MD_VOCAB as u32]).unwrap_err();
+        assert!(e.contains("fuori vocabolario"), "errore poco chiaro: {e}");
+    }
+
 }

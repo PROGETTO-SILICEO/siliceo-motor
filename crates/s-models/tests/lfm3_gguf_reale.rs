@@ -152,3 +152,35 @@ fn lfm3_pesi_forme() {
 }
 
 
+
+#[test]
+#[ignore = "carica ~6,9 GB in f32: serve una macchina con RAM libera (F10-8b)"]
+fn lfm3_model_completo_genera() {
+    use s_models::lfm3::Lfm3Model;
+
+    let path = gguf_path();
+    if !std::path::Path::new(&path).exists() {
+        eprintln!("SKIP: file GGUF assente ({path}) — scaricarlo come da T002");
+        return;
+    }
+
+    eprintln!("carico il Model completo in f32 (~6,9 GB): può richiedere minuti");
+    let model = Lfm3Model::load(&path).unwrap_or_else(|e| panic!("Lfm3Model::load: {e}"));
+    // BOS ufficiale di LFM3-1.7B (config.json: bos_token_id=124894).
+    let logits = model
+        .forward(&[124_894])
+        .unwrap_or_else(|e| panic!("forward: {e}"));
+    assert_eq!(
+        logits.len(),
+        model.config.vocab_size,
+        "logits di lunghezza vocab"
+    );
+    assert!(
+        logits.iter().all(|v| v.is_finite()),
+        "logits non finiti: il Model completo non è pronto per la parity"
+    );
+    println!(
+        "✅ LFM3 MODEL: load completo + forward di 1 token, {} logits finiti",
+        logits.len()
+    );
+}
